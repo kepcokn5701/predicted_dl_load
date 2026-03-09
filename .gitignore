@@ -1,0 +1,11 @@
+# Excel temp files
+~$*.xlsx
+~$*.xls
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.vscode/
