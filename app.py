@@ -19,7 +19,9 @@
 
 import os
 import sys
+import re
 import calendar
+import pickle
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from datetime import datetime, timedelta
@@ -159,12 +161,11 @@ class DataManager:
         12개 월별 파일을 하나로 병합
     """
 
-    # 마스킹 문자 통일 (파일 간 'X', '*', '○' 등 혼용 대응)
-    MASK_CHARS = ("X", "*", "○", "●", "x")
-    MASK_UNIFIED = "*"
-
     # 요일 한글 매핑
     WEEKDAY_KR = ("월", "화", "수", "목", "금", "토", "일")
+
+    # 정규식: 한글·영문·숫자만 남기고 나머지 모두 제거
+    _RE_CLEAN = re.compile(r'[^가-힣a-zA-Z0-9]')
 
     def __init__(self):
         self.substations: dict = {}          # {변전소: [(대상선로, 전환선로), ...]}
@@ -172,12 +173,19 @@ class DataManager:
         self._year: int = datetime.now().year
 
     @classmethod
-    def _unify_name(cls, name: str) -> str:
-        """마스킹 문자를 통일하여 파일 간 매칭이 가능하도록 한다."""
-        for ch in cls.MASK_CHARS:
-            if ch != cls.MASK_UNIFIED:
-                name = name.replace(ch, cls.MASK_UNIFIED)
-        return name
+    def _clean_text(cls, val) -> str:
+        """
+        정규식으로 한글·영문·숫자 외 모든 문자를 완전 제거.
+
+        마스킹 기호(*, X, ○, ●), 일반 공백, 탭(\\t), 줄바꿈(\\n),
+        영폭 공백(\\u200b), 전각 공백(\\u3000) 등 모두 제거.
+
+        예: '월*촌'  → '월촌'
+            '구 산 ' → '구산'
+            '월\\t촌' → '월촌'
+            '서*울 D/L' → '서울DL'
+        """
+        return cls._RE_CLEAN.sub('', str(val))
 
     # ─────────────────────────────────
     #  매핑 파일 로드
@@ -200,7 +208,7 @@ class DataManager:
 
                 # 변전소명 행 감지
                 if c0 == "변전소명":
-                    current_sub = self._unify_name(c1) if c1 else c1
+                    current_sub = self._clean_text(c1) if c1 else c1
                     continue
                 # 헤더 행 건너뛰기
                 if c0 in ("대상선로", ""):
@@ -208,8 +216,8 @@ class DataManager:
                 # 데이터 행
                 if current_sub and c0:
                     self.substations.setdefault(
-                        self._unify_name(current_sub), []
-                    ).append((self._unify_name(c0), self._unify_name(c3)))
+                        self._clean_text(current_sub), []
+                    ).append((self._clean_text(c0), self._clean_text(c3)))
 
             n_s = len(self.substations)
             n_p = sum(len(v) for v in self.substations.values())
@@ -267,8 +275,8 @@ class DataManager:
 
                 # 변전소명 전방 채움 (병합셀 → NaN 처리)
                 df["변전소명"] = df["변전소명"].ffill()
-                df["변전소명"] = df["변전소명"].astype(str).str.strip().apply(self._unify_name)
-                df["회선명"] = df["회선명"].astype(str).str.strip().apply(self._unify_name)
+                df["변전소명"] = df["변전소명"].astype(str).str.strip().apply(self._clean_text)
+                df["회선명"] = df["회선명"].astype(str).str.strip().apply(self._clean_text)
 
                 # 일자를 문자열로 통일
                 df["일자"] = df["일자"].apply(self._normalize_date)
@@ -379,7 +387,6 @@ class DataManager:
         ].copy()
 
         df_transfer = self.master_df[
-            (self.master_df["변전소명"] == sub) &
             (self.master_df["회선명"] == transfer)
         ].copy()
 
@@ -452,7 +459,6 @@ class DataManager:
         df_transfer = pd.DataFrame()
         if transfer:
             df_transfer = self.master_df[
-                (self.master_df["변전소명"] == sub) &
                 (self.master_df["회선명"] == transfer) &
                 (self.master_df["일자"].str.startswith(month_str))
             ].copy()
@@ -634,8 +640,8 @@ class DataManager:
                     df = df[df["회선명"].notna()].copy()
                     df = df[df["회선명"].apply(lambda x: str(x).strip() not in ("", "회선명"))].copy()
                     df["변전소명"] = df["변전소명"].ffill()
-                    df["변전소명"] = df["변전소명"].astype(str).str.strip().apply(self._unify_name)
-                    df["회선명"] = df["회선명"].astype(str).str.strip().apply(self._unify_name)
+                    df["변전소명"] = df["변전소명"].astype(str).str.strip().apply(self._clean_text)
+                    df["회선명"] = df["회선명"].astype(str).str.strip().apply(self._clean_text)
                     df["일자"] = df["일자"].apply(self._normalize_date)
                     for h in range(1, 25):
                         col = f"{h}시"
@@ -708,7 +714,34 @@ class LoadPredictor:
 
         df = dm.get_ml_ready_df(sub, line)
         if df.empty or len(df) < 14:
-            return False, f"학습 데이터 부족 (최소 14일 필요, 현재 {len(df)}일)"
+            # 디버깅용 상세 메시지: 왜 데이터가 부족한지 표시
+            n_found = len(df)
+            # master_df에서 해당 변전소의 회선명 목록 추출 (유사 이름 힌트)
+            hint = ""
+            if dm.has_data():
+                if sub:
+                    sub_df = dm.master_df[dm.master_df["변전소명"] == sub]
+                    available = sorted(sub_df["회선명"].unique().tolist()) if not sub_df.empty else []
+                    if available:
+                        hint = f"\n\n[참고] '{sub}' 변전소에 존재하는 회선명 목록:\n  " + ", ".join(available[:20])
+                        if len(available) > 20:
+                            hint += f" ... 외 {len(available)-20}개"
+                    else:
+                        hint = f"\n\n[참고] '{sub}' 변전소와 일치하는 데이터가 없습니다."
+                else:
+                    available = sorted(dm.master_df["회선명"].unique().tolist())
+                    if available:
+                        hint = f"\n\n[참고] 전체 데이터에 존재하는 회선명 목록:\n  " + ", ".join(available[:20])
+                        if len(available) > 20:
+                            hint += f" ... 외 {len(available)-20}개"
+            sub_label = f"'{sub}'" if sub else "(전체)"
+            return False, (
+                f"학습 데이터 부족!\n"
+                f"- 변전소: {sub_label}\n"
+                f"- 회선명: '{line}'\n"
+                f"- 검색된 데이터: {n_found}건 (최소 14일 필요)"
+                f"{hint}"
+            )
 
         # 일별 1행으로 정리 (중복 날짜 시 평균)
         df = df.groupby(df.index).mean(numeric_only=True)
@@ -962,6 +995,9 @@ class App(ctk.CTk):
         self.predictor = LoadPredictor()
         self.threshold = OVERLOAD_THRESHOLD  # 사용자 설정 가능 임계값
         self._pred_cache = {}  # {(sub, target): {year, target_preds, transfer_preds}}
+        self._cache_file_path = ""  # pkl 캐시 파일 경로
+        self._cached_target_year = 0  # 캐시된 예측 대상 연도
+        self._data_folder = ""  # 데이터 폴더 경로
         self.is_dark = False
         self.C = LIGHT
         ctk.set_appearance_mode("light")
@@ -1014,6 +1050,15 @@ class App(ctk.CTk):
             command=self._toggle_theme,
         )
         self.theme_btn.pack(side="right", padx=14)
+
+        self.retrain_btn = ctk.CTkButton(
+            title_bar, text="🔄 AI 재학습 (데이터 갱신)", width=200, height=28,
+            font=ctk.CTkFont(family=FONT_FAMILY, size=11, weight="bold"),
+            fg_color="#c0392b", hover_color="#e74c3c",
+            text_color="#ffffff", border_width=0,
+            command=self._on_retrain_all, state="disabled",
+        )
+        self.retrain_btn.pack(side="right", padx=(0, 6))
 
         # ═══ 데이터 로드 카드 ═══
         load_card = ctk.CTkFrame(self, fg_color=C["card_bg"], corner_radius=10)
@@ -1320,19 +1365,36 @@ class App(ctk.CTk):
         if not folder:
             return
         self.usage_var.set(folder)
+        self._data_folder = folder
+        self._cache_file_path = os.path.join(folder, "ai_total_prediction_cache.pkl")
+        self.retrain_btn.configure(state="normal")
+
+        # pkl 캐시 존재 확인 → 있으면 즉시 로드 (엑셀/학습 전면 생략)
+        if os.path.exists(self._cache_file_path) and self.dm.substations:
+            self.status_var.set("  캐시 파일 로딩 중...")
+            self.update_idletasks()
+            if self._load_cache_file():
+                n_keys = len(self._pred_cache)
+                self.status_var.set(
+                    f"  캐시 로드 완료 (초고속 모드) | {self._cached_target_year}년 예측 | {n_keys}개 선로")
+                return
+
+        # pkl 없음 → 기존 흐름: 엑셀 로드
         self.status_var.set("  데이터 로딩 중...")
         self.update_idletasks()
-
         ok, msg = self.dm.load_usage_multi_year(folder)
-        if ok:
-            prev = self.status_var.get().replace("  데이터 로딩 중...", "").strip()
-            base = prev if prev and "매핑" in prev else ""
-            self.status_var.set(f"  {base}  |  데이터: {msg}" if base else f"  데이터: {msg}")
-            # 예측 캐시 초기화 (새 데이터 로드 시)
-            self._pred_cache = {}
-        else:
+        if not ok:
             self.status_var.set(f"  오류: {msg}")
             messagebox.showerror("데이터 로드 오류", msg)
+            return
+
+        # 매핑 로드 완료 상태면 자동 일괄 학습
+        if self.dm.substations:
+            self.status_var.set(f"  데이터: {msg} | 전체 선로 일괄 학습을 시작합니다...")
+            self.update_idletasks()
+            self._batch_train_all()
+        else:
+            self.status_var.set(f"  데이터: {msg} (매핑 파일 로드 후 [AI 재학습] 버튼을 눌러주세요)")
 
     def _get_threshold(self) -> float:
         """임계값 Entry에서 현재 값을 읽어 반환."""
@@ -1346,6 +1408,160 @@ class App(ctk.CTk):
             self.threshold = OVERLOAD_THRESHOLD
             return OVERLOAD_THRESHOLD
 
+    # ──────────────────────────────────
+    #  pkl 캐시 로드 / 저장 / 일괄 학습
+    # ──────────────────────────────────
+    def _load_cache_file(self) -> bool:
+        """pkl 캐시 파일 로드. 성공하면 True."""
+        if not self._cache_file_path or not os.path.exists(self._cache_file_path):
+            return False
+        try:
+            with open(self._cache_file_path, "rb") as f:
+                cache_data = pickle.load(f)
+            self._pred_cache = cache_data.get("predictions", {})
+            self._cached_target_year = cache_data.get("target_year", 0)
+            return True
+        except Exception as e:
+            print(f"캐시 로드 실패: {e}")
+            return False
+
+    def _save_cache_file(self):
+        """현재 _pred_cache를 pkl 파일로 저장."""
+        if not self._cache_file_path:
+            return
+        cache_data = {
+            "version": 1,
+            "target_year": self._cached_target_year,
+            "data_folder": self._data_folder,
+            "predictions": self._pred_cache,
+        }
+        try:
+            with open(self._cache_file_path, "wb") as f:
+                pickle.dump(cache_data, f, protocol=pickle.HIGHEST_PROTOCOL)
+        except Exception as e:
+            messagebox.showerror("캐시 저장 오류", f"pkl 파일 저장 실패:\n{e}")
+
+    def _batch_train_all(self):
+        """전체 선로 일괄 XGBoost 학습 + 예측 → pkl 저장."""
+        if not self.dm.substations:
+            messagebox.showwarning("알림", "전환선로 매핑 파일을 먼저 로드해주세요.")
+            return
+        if not self.dm.has_data():
+            messagebox.showwarning("알림", "과거 부하량 데이터를 먼저 로드해주세요.")
+            return
+
+        # 전체 선로 쌍 수집
+        all_pairs = []
+        for sub, lines in self.dm.substations.items():
+            for target, transfer in lines:
+                all_pairs.append((sub, target, transfer))
+        total = len(all_pairs)
+        if total == 0:
+            return
+
+        target_year = self.dm._year + 1
+        self._cached_target_year = target_year
+        self._pred_cache = {}
+
+        # Progress Bar 팝업
+        prog_win = ctk.CTkToplevel(self)
+        prog_win.title("AI 전체 선로 일괄 학습")
+        prog_win.geometry("480x170")
+        prog_win.resizable(False, False)
+        prog_win.attributes("-topmost", True)
+        prog_win.grab_set()
+        # 화면 중앙
+        prog_win.update_idletasks()
+        sw = prog_win.winfo_screenwidth()
+        sh = prog_win.winfo_screenheight()
+        x = (sw - 480) // 2
+        y = (sh - 170) // 2
+        prog_win.geometry(f"480x170+{x}+{y}")
+
+        ctk.CTkLabel(
+            prog_win, text="AI 전체 선로 일괄 학습 중...",
+            font=ctk.CTkFont(family=FONT_FAMILY, size=14, weight="bold"),
+        ).pack(pady=(18, 6))
+
+        prog_label = ctk.CTkLabel(
+            prog_win, text=f"준비 중... (0/{total})",
+            font=ctk.CTkFont(family=FONT_FAMILY, size=12),
+        )
+        prog_label.pack(pady=(0, 8))
+
+        prog_bar = ctk.CTkProgressBar(prog_win, width=400, height=18)
+        prog_bar.pack(pady=(0, 6))
+        prog_bar.set(0)
+
+        fail_label = ctk.CTkLabel(
+            prog_win, text="",
+            font=ctk.CTkFont(family=FONT_FAMILY, size=10),
+            text_color="#e74c3c",
+        )
+        fail_label.pack(pady=(0, 4))
+
+        self.update_idletasks()
+
+        success_count = 0
+        fail_count = 0
+
+        for idx, (sub, target, transfer) in enumerate(all_pairs):
+            prog_label.configure(text=f"연산 중... {sub}/{target} ({idx+1}/{total})")
+            prog_bar.set((idx) / total)
+            self.update_idletasks()
+
+            # _train_and_predict_year 내부 로직 직접 실행 (캐시 체크 포함)
+            result = self._train_and_predict_year(sub, target)
+            if result:
+                success_count += 1
+            else:
+                fail_count += 1
+                fail_label.configure(text=f"실패: {fail_count}건")
+
+        prog_bar.set(1.0)
+        prog_label.configure(text=f"완료! 성공 {success_count} / 실패 {fail_count} (총 {total})")
+        self.update_idletasks()
+
+        # pkl 저장
+        self._save_cache_file()
+
+        # 잠시 후 팝업 닫기
+        prog_win.after(1200, prog_win.destroy)
+
+        self.status_var.set(
+            f"  AI 일괄 학습 완료 | {target_year}년 예측 | "
+            f"성공 {success_count} / 실패 {fail_count} (총 {total}) | 캐시 저장됨")
+
+    def _on_retrain_all(self):
+        """기존 캐시 무시, 엑셀 재로드 + 전체 일괄 재학습."""
+        if not self.dm.substations:
+            messagebox.showwarning("알림", "전환선로 매핑 파일을 먼저 로드해주세요.")
+            return
+        if not self._data_folder:
+            messagebox.showwarning("알림", "데이터 폴더를 먼저 선택해주세요.")
+            return
+
+        # 기존 캐시 삭제
+        if self._cache_file_path and os.path.exists(self._cache_file_path):
+            try:
+                os.remove(self._cache_file_path)
+            except Exception:
+                pass
+        self._pred_cache = {}
+
+        # 엑셀 데이터 (재)로드
+        self.status_var.set("  데이터 재로딩 중...")
+        self.update_idletasks()
+        ok, msg = self.dm.load_usage_multi_year(self._data_folder)
+        if not ok:
+            self.status_var.set(f"  오류: {msg}")
+            messagebox.showerror("데이터 로드 오류", msg)
+            return
+
+        self.status_var.set(f"  데이터: {msg} | 전체 선로 일괄 재학습을 시작합니다...")
+        self.update_idletasks()
+        self._batch_train_all()
+
     def _train_and_predict_year(self, sub: str, target: str) -> dict | None:
         """대상선로 + 전환선로 각각 XGBoost 학습 → Target Year 전체 예측."""
         if not self.dm.has_data():
@@ -1354,7 +1570,9 @@ class App(ctk.CTk):
 
         transfer = self.dm.get_transfer_line(sub, target)
         if not transfer:
-            messagebox.showwarning("알림", f"'{target}'의 전환선로를 찾을 수 없습니다.")
+            messagebox.showwarning("알림",
+                f"'{target}'의 전환선로를 찾을 수 없습니다.\n\n"
+                f"매핑 파일에서 '{sub}' 변전소의 선로 매핑을 확인해 주세요.")
             return None
 
         last_year = self.dm._year
@@ -1365,26 +1583,56 @@ class App(ctk.CTk):
         if cache_key in self._pred_cache and self._pred_cache[cache_key]["year"] == target_year:
             return self._pred_cache[cache_key]
 
-        self.status_var.set(f"  AI 학습 중... ({sub}/{target})")
+        # ── 학습 전 데이터 존재 여부 사전 점검 ──
+        target_df = self.dm.master_df[
+            (self.dm.master_df["변전소명"] == sub) &
+            (self.dm.master_df["회선명"] == target)
+        ]
+        transfer_df = self.dm.master_df[
+            (self.dm.master_df["회선명"] == transfer)
+        ]
+        if target_df.empty or transfer_df.empty:
+            detail = (
+                f"데이터 누락 발생!\n\n"
+                f"- 대상선로('{target}'): {len(target_df)}건\n"
+                f"- 전환선로('{transfer}'): {len(transfer_df)}건\n\n"
+                f"둘 중 하나라도 데이터가 0건이면 예측할 수 없습니다.\n"
+                f"엑셀 파일의 회선명을 확인해 주세요."
+            )
+            # 유사 이름 힌트
+            if target_df.empty:
+                sub_lines = self.dm.master_df[self.dm.master_df["변전소명"] == sub]
+                if not sub_lines.empty:
+                    available = sorted(sub_lines["회선명"].unique().tolist())
+                    detail += f"\n\n['{sub}' 변전소 회선명 목록]\n  " + ", ".join(available[:30])
+            if transfer_df.empty:
+                all_lines = sorted(self.dm.master_df["회선명"].unique().tolist())
+                detail += f"\n\n[전체 데이터 회선명 목록]\n  " + ", ".join(all_lines[:30])
+            self.status_var.set(f"  데이터 누락: {target} 또는 {transfer}")
+            messagebox.showerror("데이터 누락", detail)
+            return None
+
+        self.status_var.set(f"  AI 학습 중... ({sub}/{target}: {len(target_df)}건)")
         self.update_idletasks()
 
         # 대상선로 학습 + 예측
         pred_target = LoadPredictor()
         ok, msg = pred_target.train(self.dm, sub, target)
         if not ok:
-            self.status_var.set(f"  대상선로 학습 실패: {msg}")
-            messagebox.showerror("AI 학습 오류", f"대상선로({target}): {msg}")
+            self.status_var.set(f"  대상선로 학습 실패")
+            messagebox.showerror("AI 학습 오류", f"대상선로({target}):\n{msg}")
             return None
 
-        self.status_var.set(f"  대상선로 학습 완료. 전환선로 학습 중... ({sub}/{transfer})")
+        self.status_var.set(
+            f"  대상선로 학습 완료. 전환선로 학습 중... ({transfer}: {len(transfer_df)}건)")
         self.update_idletasks()
 
         # 전환선로 학습 + 예측
         pred_transfer = LoadPredictor()
-        ok, msg = pred_transfer.train(self.dm, sub, transfer)
+        ok, msg = pred_transfer.train(self.dm, None, transfer)
         if not ok:
-            self.status_var.set(f"  전환선로 학습 실패: {msg}")
-            messagebox.showerror("AI 학습 오류", f"전환선로({transfer}): {msg}")
+            self.status_var.set(f"  전환선로 학습 실패")
+            messagebox.showerror("AI 학습 오류", f"전환선로({transfer}):\n{msg}")
             return None
 
         self.status_var.set(f"  {target_year}년 예측 계산 중...")
@@ -1436,8 +1684,10 @@ class App(ctk.CTk):
         if not self.dm.substations:
             messagebox.showwarning("알림", "전환선로 매핑 파일을 먼저 로드해주세요.")
             return
-        if not self.dm.has_data():
-            messagebox.showwarning("알림", "과거 부하량 데이터를 먼저 로드해주세요.")
+        if not self._pred_cache:
+            messagebox.showwarning("알림",
+                "예측 데이터가 없습니다.\n"
+                "데이터 폴더를 선택하거나 [AI 재학습] 버튼을 눌러주세요.")
             return
         if target in ("(선로 없음)", "변전소를 선택하세요"):
             messagebox.showwarning("알림", "휴전선로(대상선로)를 선택해주세요.")
@@ -1447,36 +1697,21 @@ class App(ctk.CTk):
         self._current_target = target
         self._current_transfer = transfer
 
-        # 임계값 읽기
         threshold = self._get_threshold()
 
-        # 계산 중 표시
-        for w in self.t1_dashboard.winfo_children():
-            w.destroy()
-        ctk.CTkLabel(
-            self.t1_dashboard, text="AI 학습 및 예측 중... (잠시 기다려주세요)",
-            font=ctk.CTkFont(family=FONT_FAMILY, size=14), text_color=self.C["text_sub"],
-        ).place(relx=0.5, rely=0.5, anchor="center")
-        self.update_idletasks()
-
-        # AI 학습 + 예측
-        pred_result = self._train_and_predict_year(sub, target)
-        if pred_result is None:
-            for w in self.t1_dashboard.winfo_children():
-                w.destroy()
-            ctk.CTkLabel(
-                self.t1_dashboard, text="예측 실패. 데이터를 확인해주세요.",
-                font=ctk.CTkFont(family=FONT_FAMILY, size=14), text_color=self.C["ng"],
-            ).place(relx=0.5, rely=0.5, anchor="center")
+        # 캐시에서 즉시 조회 (재학습 없음)
+        cache_key = (sub, target)
+        pred_result = self._pred_cache.get(cache_key)
+        if not pred_result:
+            messagebox.showwarning("알림",
+                f"'{target}' 선로의 예측 데이터가 없습니다.\n"
+                "[AI 재학습] 버튼을 눌러 전체 데이터를 갱신해 주세요.")
             return
 
         target_year = pred_result["year"]
-        target_preds = pred_result["target_preds"]
-        transfer_preds = pred_result["transfer_preds"]
-
-        # 월별 가능 일수 계산 (예측 기반)
         monthly = self._calc_predicted_monthly(
-            target_year, target_preds, transfer_preds, threshold)
+            target_year, pred_result["target_preds"],
+            pred_result["transfer_preds"], threshold)
         self._t1_render(monthly, sub, target, transfer, target_year)
 
     def _calc_predicted_monthly(self, target_year: int,
@@ -1595,8 +1830,10 @@ class App(ctk.CTk):
         if not self.dm.substations:
             messagebox.showwarning("알림", "전환선로 매핑 파일을 먼저 로드해주세요.")
             return
-        if not self.dm.has_data():
-            messagebox.showwarning("알림", "과거 부하량 데이터를 먼저 로드해주세요.")
+        if not self._pred_cache:
+            messagebox.showwarning("알림",
+                "예측 데이터가 없습니다.\n"
+                "데이터 폴더를 선택하거나 [AI 재학습] 버튼을 눌러주세요.")
             return
         if sub == "데이터를 먼저 로드하세요":
             messagebox.showwarning("알림", "변전소를 선택해주세요.")
@@ -1604,28 +1841,14 @@ class App(ctk.CTk):
 
         threshold = self._get_threshold()
 
-        # 계산 중 표시
-        for w in self.t2_header_fr.winfo_children():
-            w.destroy()
-        for w in self.t2_scroll.winfo_children():
-            w.destroy()
-        ctk.CTkLabel(
-            self.t2_scroll, text="AI 학습 및 예측 중... (선로가 많으면 시간이 걸릴 수 있습니다)",
-            font=ctk.CTkFont(family=FONT_FAMILY, size=13), text_color=self.C["text_sub"],
-        ).pack(pady=40)
-        self.update_idletasks()
-
         lines = self.dm.substations.get(sub, [])
-        target_year = self.dm._year + 1
+        target_year = self._cached_target_year
         all_data = []
 
-        for line_idx, (target, transfer) in enumerate(lines):
-            self.status_var.set(
-                f"  [{line_idx+1}/{len(lines)}] {target} → {transfer} 학습/예측 중...")
-            self.update_idletasks()
-
-            pred_result = self._train_and_predict_year(sub, target)
-            if pred_result is None:
+        for target, transfer in lines:
+            cache_key = (sub, target)
+            pred_result = self._pred_cache.get(cache_key)
+            if not pred_result:
                 all_data.append((target, transfer, [None] * 12))
                 continue
 
@@ -1635,7 +1858,7 @@ class App(ctk.CTk):
             all_data.append((target, transfer, monthly))
 
         self.status_var.set(
-            f"  AI 예측 완료 | {target_year}년 | {sub} 변전소 {len(lines)}개 선로")
+            f"  조회 완료 | {target_year}년 AI 예측 | {sub} 변전소 {len(lines)}개 선로")
         self._t2_render(sub, all_data, target_year)
 
     def _t2_render(self, sub: str, all_data: list, target_year: int = None):
@@ -1821,6 +2044,8 @@ class App(ctk.CTk):
         popup.geometry("1200x920")
         popup.resizable(True, True)
         popup.minsize(900, 700)
+        popup.attributes("-topmost", True)
+        popup.after(100, popup.focus_force)
 
         # ★ 최상단 노출: 열릴 때 맨 앞으로, 이후 사용자 자유 조작 허용
         popup.attributes("-topmost", True)
