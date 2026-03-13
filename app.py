@@ -1,25 +1,45 @@
 """
 =============================================================================
-  배전선로 휴전 가능월 검토 프로그램 v5.0
-  Distribution Line Suspension Monthly Feasibility Review
+  배전선로 휴전 가능월 검토 프로그램 v9.0  —  AI 미래 예측 엔진
+  Distribution Line Suspension Feasibility Review (AI Prediction Engine)
 
-  - 종합 결과 엑셀 파일 1개에서 네 시트를 읽어 UI에 표출
-    ① '전환선로' 시트 → 콤보박스 매핑
-    ② '절체가능여부 판단결과' 시트 → 월별 절체 가능 일수
-    ③ '일일 최대부하' 시트 → 대상선로 일별 부하
-    ④ '전환선로 부하' 시트 → 전환선로 일별 부하
-  - 탭 1: 단일 선로 상세 조회 (카드형 대시보드 + 월 클릭 시 일별 팝업)
-  - 탭 2: 변전소 종합 조회 (전 선로 히트맵 Grid, 대상선로 클릭 → 탭 1 연동)
-  - 색상 기준: 22일+ 유력(Green) | 13~21일 고려(Orange) | 12일- 불가(Red)
+  ■ 입력
+    ① 전환선로 매핑 파일 (변전소명, 대상선로, 전환선로)
+    ② 과거 부하량 데이터 폴더 (연도별 하위 폴더 또는 단일 폴더)
+
+  ■ 핵심 로직
+    1) 과거 데이터로 XGBoost 학습 (대상선로 / 전환선로 각각)
+    2) 미래 1년(Target Year) 365일 전체 부하 예측
+    3) 예측 합산 최대 ≤ 기준값 → 가능(O) / 초과 → 불가(X)
+    4) 월별 가능(O) 일수를 AI 예측 기반으로 표시
+
+  ■ 색상 기준: 22일+ 유력(Green) | 13~21일 고려(Orange) | 12일- 불가(Red)
 =============================================================================
 """
 
+import os
 import sys
+import calendar
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
+from datetime import datetime, timedelta
+import traceback
 
+import numpy as np
 import pandas as pd
 import customtkinter as ctk
+
+import matplotlib
+matplotlib.use("TkAgg")
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.figure import Figure
+
+from xgboost import XGBRegressor
+
+# matplotlib 한글 폰트 설정
+matplotlib.rcParams["font.family"] = "Malgun Gothic" if sys.platform != "darwin" else "AppleGothic"
+matplotlib.rcParams["axes.unicode_minus"] = False
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -31,7 +51,7 @@ if sys.platform == "darwin":
 
 LEVEL_HIGH = 22   # 이상 → 유력
 LEVEL_MID  = 13   # 이상 → 고려, 미만 → 불가
-OVERLOAD_THRESHOLD = 10  # 합산 부하 초과 기준 (빨간색 표시)
+OVERLOAD_THRESHOLD = 10  # 합산 부하 초과 기준
 
 # ── 라이트 테마 ──
 LIGHT = {
@@ -70,6 +90,13 @@ LIGHT = {
     "popup_bg":     "#ffffff",
     "overload_bg":  "#fadbd8",
     "overload_fg":  "#c0392b",
+    "graph_target": "#3498db",
+    "graph_transfer":"#e67e22",
+    "graph_total":  "#e74c3c",
+    "graph_line":   "#bdc3c7",
+    "weekend_bg":   "#e8f0fe",
+    "weekend_fg":   "#1a5276",
+    "weekend_chart":"#dce8f5",
 }
 
 # ── 다크 테마 ──
@@ -109,195 +136,210 @@ DARK = {
     "popup_bg":     "#16213e",
     "overload_bg":  "#4a1a1a",
     "overload_fg":  "#ff6b6b",
+    "graph_target": "#4fc3f7",
+    "graph_transfer":"#f39c12",
+    "graph_total":  "#ff6b6b",
+    "graph_line":   "#636e72",
+    "weekend_bg":   "#1e2d45",
+    "weekend_fg":   "#81d4fa",
+    "weekend_chart":"#1a2540",
 }
 
 
 # ═══════════════════════════════════════════════════════════════
-#  데이터 매니저
+#  데이터 매니저 (자동 계산 엔진)
 # ═══════════════════════════════════════════════════════════════
 class DataManager:
-    """종합 결과 엑셀에서 네 시트를 파싱"""
+    """
+    Raw Data를 직접 읽어와 프로그램 내부에서 합산/판정하는 자동 계산 엔진.
 
-    SHEET_MAPPING        = "전환선로"
-    SHEET_RESULT         = "절체가능여부 판단결과"
-    SHEET_DAILY_TARGET   = "일일 최대부하"
-    SHEET_DAILY_TRANSFER = "전환선로 부하"
+    ■ 매핑 파일: {변전소: [(대상선로, 전환선로), ...]}
+    ■ 사용량 파일: Master DataFrame
+        columns = [변전소명, 회선명, 일자(YYYYMMDD), 1시~24시]
+        12개 월별 파일을 하나로 병합
+    """
+
+    # 마스킹 문자 통일 (파일 간 'X', '*', '○' 등 혼용 대응)
+    MASK_CHARS = ("X", "*", "○", "●", "x")
+    MASK_UNIFIED = "*"
+
+    # 요일 한글 매핑
+    WEEKDAY_KR = ("월", "화", "수", "목", "금", "토", "일")
 
     def __init__(self):
-        self.substations: dict = {}   # {변전소: [(대상선로, 전환선로), ...]}
-        self.results: dict     = {}   # {(변전소, 대상선로): [1월~12월 가능일수]}
-        # ── 일별 부하 데이터 ──
-        self.daily_target: dict   = {}  # {(변전소, 대상선로, month_idx): [day1..day31]}
-        self.daily_transfer: dict = {}  # {(변전소, 대상선로, month_idx): [day1..day31]}
-        self.month_offsets: list  = []  # [(col_start, num_days), ...] 12개월
+        self.substations: dict = {}          # {변전소: [(대상선로, 전환선로), ...]}
+        self.master_df: pd.DataFrame = None  # 병합된 시간대별 사용량
+        self._year: int = datetime.now().year
 
-    def load_excel(self, filepath: str) -> tuple[bool, str]:
+    @classmethod
+    def _unify_name(cls, name: str) -> str:
+        """마스킹 문자를 통일하여 파일 간 매칭이 가능하도록 한다."""
+        for ch in cls.MASK_CHARS:
+            if ch != cls.MASK_UNIFIED:
+                name = name.replace(ch, cls.MASK_UNIFIED)
+        return name
+
+    # ─────────────────────────────────
+    #  매핑 파일 로드
+    # ─────────────────────────────────
+    def load_mapping(self, filepath: str) -> tuple[bool, str]:
+        """전환선로 매핑 엑셀을 파싱한다."""
         try:
-            xls = pd.ExcelFile(filepath)
-            available = xls.sheet_names
+            df = pd.read_excel(filepath, header=None)
         except Exception as e:
-            return False, f"파일 열기 실패: {e}"
+            return False, f"매핑 파일 열기 실패: {e}"
 
-        msgs = []
-        ok1, m1 = self._parse_mapping(filepath, available)
-        msgs.append(m1)
-        ok2, m2 = self._parse_result(filepath, available)
-        msgs.append(m2)
-        ok3, m3 = self._parse_daily_load(filepath, available)
-        msgs.append(m3)
-        return ok1, "  |  ".join(msgs)
-
-    # ─── 전환선로 매핑 파싱 ───
-    def _parse_mapping(self, filepath, available) -> tuple[bool, str]:
-        if self.SHEET_MAPPING not in available:
-            return False, f"'{self.SHEET_MAPPING}' 시트 없음"
         try:
-            df = pd.read_excel(filepath, sheet_name=self.SHEET_MAPPING)
             self.substations = {}
-            current_sub = str(df.columns[1]).strip()
+            current_sub = None
+
             for i in range(len(df)):
-                c0 = df.iloc[i, 0]
-                if pd.isna(c0):
-                    continue
-                c0 = str(c0).strip()
+                c0 = str(df.iloc[i, 0]).strip() if pd.notna(df.iloc[i, 0]) else ""
+                c1 = str(df.iloc[i, 1]).strip() if pd.notna(df.iloc[i, 1]) else ""
+                c3 = str(df.iloc[i, 3]).strip() if df.shape[1] > 3 and pd.notna(df.iloc[i, 3]) else ""
+
+                # 변전소명 행 감지
                 if c0 == "변전소명":
-                    current_sub = str(df.iloc[i, 1]).strip() if pd.notna(df.iloc[i, 1]) else current_sub
+                    current_sub = self._unify_name(c1) if c1 else c1
                     continue
-                if c0 == "대상선로":
+                # 헤더 행 건너뛰기
+                if c0 in ("대상선로", ""):
                     continue
-                transfer = str(df.iloc[i, 3]).strip() if pd.notna(df.iloc[i, 3]) else ""
-                self.substations.setdefault(current_sub, []).append((c0, transfer))
+                # 데이터 행
+                if current_sub and c0:
+                    self.substations.setdefault(
+                        self._unify_name(current_sub), []
+                    ).append((self._unify_name(c0), self._unify_name(c3)))
+
             n_s = len(self.substations)
             n_p = sum(len(v) for v in self.substations.values())
-            return True, f"매핑: {n_s}개 변전소, {n_p}개 선로"
+            return True, f"{n_s}개 변전소, {n_p}개 선로 매핑 완료"
         except Exception as e:
-            return False, f"매핑 오류: {e}"
+            return False, f"매핑 파싱 오류: {e}"
 
-    # ─── 절체가능여부 판단결과 파싱 ───
-    def _parse_result(self, filepath, available) -> tuple[bool, str]:
-        if self.SHEET_RESULT not in available:
-            return False, f"'{self.SHEET_RESULT}' 시트 없음"
+    # ─────────────────────────────────
+    #  사용량 폴더 로드
+    # ─────────────────────────────────
+    def load_usage_folder(self, folder_path: str) -> tuple[bool, str]:
+        """
+        1월~12월 시간대별 사용량 엑셀 파일들을 읽어 Master DataFrame으로 병합.
+
+        각 파일 구조:
+          - Row 0~2: 빈 행 (병합 헤더 등)
+          - Row 3: [변전소명, 회선명, 일자, 일일 사용량, ...]
+          - Row 4: [, , , 1시, 2시, ..., 24시]
+          - Row 5~: 데이터
+        """
+        xlsx_files = sorted([
+            f for f in os.listdir(folder_path)
+            if f.endswith(('.xlsx', '.xls')) and not f.startswith('~$')
+        ])
+
+        if not xlsx_files:
+            return False, "폴더에 엑셀 파일이 없습니다."
+
+        frames = []
+        errors = []
+        col_names = ["변전소명", "회선명", "일자"] + [f"{h}시" for h in range(1, 25)]
+
+        for fname in xlsx_files:
+            fpath = os.path.join(folder_path, fname)
+            try:
+                # engine='calamine' 시도, 실패 시 openpyxl 폴백
+                try:
+                    df = pd.read_excel(fpath, header=None, skiprows=4, engine="calamine")
+                except Exception:
+                    df = pd.read_excel(fpath, header=None, skiprows=4)
+
+                # 컬럼 수 확인 및 보정
+                if df.shape[1] < 27:
+                    # 부족한 컬럼 패딩
+                    for _ in range(27 - df.shape[1]):
+                        df[df.shape[1]] = None
+                elif df.shape[1] > 27:
+                    df = df.iloc[:, :27]
+
+                df.columns = col_names
+
+                # 헤더 행 제거 (skiprows 후에도 남을 수 있는 부제목 행)
+                df = df[df["회선명"].notna()].copy()
+                df = df[df["회선명"].apply(lambda x: str(x).strip() not in ("", "회선명"))].copy()
+
+                # 변전소명 전방 채움 (병합셀 → NaN 처리)
+                df["변전소명"] = df["변전소명"].ffill()
+                df["변전소명"] = df["변전소명"].astype(str).str.strip().apply(self._unify_name)
+                df["회선명"] = df["회선명"].astype(str).str.strip().apply(self._unify_name)
+
+                # 일자를 문자열로 통일
+                df["일자"] = df["일자"].apply(self._normalize_date)
+
+                # 1시~24시 숫자 변환 (결측치 → 0)
+                for h in range(1, 25):
+                    col = f"{h}시"
+                    df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+
+                frames.append(df)
+            except Exception as e:
+                errors.append(f"{fname}: {e}")
+
+        if not frames:
+            return False, f"유효한 데이터 없음. 오류: {'; '.join(errors)}"
+
+        self.master_df = pd.concat(frames, ignore_index=True)
+
+        # ── 시계열 전처리 구조화 (예측 모델 대비) ──
+        # 1) datetime 컬럼: pd.to_datetime으로 연도/요일 자동 인식
+        self.master_df["날짜"] = pd.to_datetime(
+            self.master_df["일자"], format="%Y%m%d", errors="coerce"
+        )
+        # 2) 요일 컬럼 (0=월 ~ 6=일)
+        self.master_df["요일번호"] = self.master_df["날짜"].dt.weekday          # 0~6
+        self.master_df["요일"] = self.master_df["요일번호"].map(
+            lambda x: self.WEEKDAY_KR[int(x)] if pd.notna(x) else ""
+        )
+        # 3) 주말 여부 (토=5, 일=6)
+        self.master_df["주말"] = self.master_df["요일번호"].isin([5, 6])
+        # 4) 연/월/일 분리 (예측 모델 피처용)
+        self.master_df["연"] = self.master_df["날짜"].dt.year
+        self.master_df["월"] = self.master_df["날짜"].dt.month
+        self.master_df["일"] = self.master_df["날짜"].dt.day
+
+        # 연도 자동 감지 (datetime 기반)
         try:
-            df = pd.read_excel(filepath, sheet_name=self.SHEET_RESULT)
-            self.results = {}
-            current_sub = None
-            for i in range(3, len(df)):
-                row = df.iloc[i]
-                if pd.notna(row.iloc[1]):
-                    current_sub = str(row.iloc[1]).strip()
-                if pd.isna(row.iloc[2]) or current_sub is None:
-                    continue
-                target = str(row.iloc[2]).strip()
-                months = []
-                for j in range(3, 15):
-                    v = row.iloc[j] if j < len(row) else None
-                    if pd.notna(v):
-                        try:
-                            months.append(int(float(v)))
-                        except (ValueError, TypeError):
-                            months.append(None)
-                    else:
-                        months.append(None)
-                self.results[(current_sub, target)] = months
-            return True, f"결과: {len(self.results)}개 선로"
-        except Exception as e:
-            return False, f"결과 오류: {e}"
+            valid_years = self.master_df["연"].dropna()
+            if not valid_years.empty:
+                self._year = int(valid_years.mode().iloc[0])
+        except Exception:
+            try:
+                sample_date = str(self.master_df["일자"].dropna().iloc[0])
+                if len(sample_date) >= 4:
+                    self._year = int(sample_date[:4])
+            except Exception:
+                pass
 
-    # ─── 일별 부하 데이터 파싱 (★ 신규) ───
-    def _parse_daily_load(self, filepath, available) -> tuple[bool, str]:
-        """
-        '일일 최대부하' + '전환선로 부하' 시트를 파싱한다.
-        두 시트의 구조는 동일:
-          - Row 0~2: 빈 행
-          - Row 3:   변전소명 | 회선명 | (빈칸) | '2025년01월 일일 사용량' | ... (월 헤더)
-          - Row 4:   (빈)     | (빈)   | (빈)   | 1 | 2 | 3 | ... | 31 | 1 | 2 | ... (일 번호)
-          - Row 5~:  데이터 행 (변전소명 | 회선명 | (빈) | 1일값 | 2일값 | ...)
-        각 월은 실제 일수만큼의 컬럼을 사용 (1월=31, 2월=28/29, ...)
-        """
-        if self.SHEET_DAILY_TARGET not in available:
-            return False, f"'{self.SHEET_DAILY_TARGET}' 시트 없음"
-        if self.SHEET_DAILY_TRANSFER not in available:
-            return False, f"'{self.SHEET_DAILY_TRANSFER}' 시트 없음"
+        # 5) 결측치 정리: datetime 변환 실패한 행 경고 (삭제하지 않음)
+        n_nat = self.master_df["날짜"].isna().sum()
 
-        try:
-            # ① 대상선로 일일 부하 파싱
-            df_t = pd.read_excel(filepath, sheet_name=self.SHEET_DAILY_TARGET, header=None)
-            self._detect_month_offsets(df_t)
-            self.daily_target = {}
-            self._parse_daily_rows(df_t, self.daily_target)
+        msg = f"{len(xlsx_files)}개 파일, {len(self.master_df):,}건 로드 완료 (연도: {self._year})"
+        if n_nat > 0:
+            msg += f" | 날짜 변환 실패: {n_nat}건"
+        if errors:
+            msg += f" (오류 {len(errors)}건)"
+        return True, msg
 
-            # ② 전환선로 부하 파싱 (구조 동일, 같은 month_offsets 사용)
-            df_tr = pd.read_excel(filepath, sheet_name=self.SHEET_DAILY_TRANSFER, header=None)
-            self.daily_transfer = {}
-            self._parse_daily_rows(df_tr, self.daily_transfer)
+    @staticmethod
+    def _normalize_date(val) -> str:
+        """일자를 'YYYYMMDD' 문자열로 정규화."""
+        if pd.isna(val):
+            return ""
+        if isinstance(val, (int, float)):
+            return str(int(val))
+        s = str(val).strip().replace("-", "").replace("/", "").replace(".", "")
+        return s[:8] if len(s) >= 8 else s
 
-            n = len(self.daily_target)
-            return True, f"일별부하: {n}건"
-        except Exception as e:
-            return False, f"일별 부하 오류: {e}"
-
-    def _detect_month_offsets(self, df):
-        """
-        Row 3의 헤더에서 '20XX년XX월 일일 사용량' 패턴을 찾아
-        각 월의 시작 컬럼과 실제 일수를 자동 감지한다.
-        예: [(3, 31), (34, 28), (62, 31), ...]  → (시작컬럼, 일수) × 12개월
-        """
-        self.month_offsets = []
-        row3 = df.iloc[3]
-        starts = []
-        for j in range(df.shape[1]):
-            v = row3.iloc[j]
-            if pd.notna(v) and isinstance(v, str) and "월" in v and "사용량" in v:
-                starts.append(j)
-
-        for i, s in enumerate(starts):
-            if i + 1 < len(starts):
-                num_days = starts[i + 1] - s
-            else:
-                num_days = df.shape[1] - s
-            self.month_offsets.append((s, num_days))
-
-    def _parse_daily_rows(self, df, storage: dict):
-        """
-        데이터 행(Row 5~)을 순회하며 일별 부하값을 storage에 저장한다.
-        Key: (변전소명, 회선명, month_idx)  →  0-indexed 월 인덱스
-        Value: [day1, day2, ..., day31]  →  31개로 패딩 (부족한 일수는 None)
-        """
-        current_sub = None
-        for i in range(5, len(df)):
-            sub_val = df.iloc[i, 0]
-            line_val = df.iloc[i, 1]
-
-            # 변전소명이 명시된 행은 갱신, NaN이면 이전 값 유지
-            if pd.notna(sub_val):
-                current_sub = str(sub_val).strip()
-            # 회선명이 없거나 변전소 미확정이면 건너뜀
-            if pd.isna(line_val) or current_sub is None:
-                continue
-
-            line = str(line_val).strip()
-
-            for m_idx, (col_start, num_days) in enumerate(self.month_offsets):
-                days = []
-                for d in range(num_days):
-                    col = col_start + d
-                    if col < df.shape[1]:
-                        v = df.iloc[i, col]
-                        if pd.notna(v):
-                            try:
-                                days.append(round(float(v), 2))
-                            except (ValueError, TypeError):
-                                days.append(None)
-                        else:
-                            days.append(None)
-                    else:
-                        days.append(None)
-                # 31일로 패딩 (28~30일인 월의 나머지는 None)
-                while len(days) < 31:
-                    days.append(None)
-                storage[(current_sub, line, m_idx)] = days
-
-    # ─── 조회 헬퍼 ───
+    # ─────────────────────────────────
+    #  조회 헬퍼
+    # ─────────────────────────────────
     def get_substation_list(self) -> list[str]:
         return sorted(self.substations.keys())
 
@@ -310,57 +352,588 @@ class DataManager:
                 return tr
         return ""
 
-    def get_monthly_days(self, sub: str, target: str) -> list:
-        return self.results.get((sub, target), [None] * 12)
+    def has_data(self) -> bool:
+        return self.master_df is not None and len(self.master_df) > 0
+
+    # ─────────────────────────────────
+    #  핵심 계산 엔진
+    # ─────────────────────────────────
+    def calc_monthly_possible_days(self, sub: str, target: str, threshold: float = OVERLOAD_THRESHOLD) -> list:
+        """
+        월별 절체 가능 일수를 계산하여 [1월, 2월, ..., 12월] 리스트로 반환.
+        데이터가 없으면 None.
+        """
+        if not self.has_data():
+            return [None] * 12
+
+        transfer = self.get_transfer_line(sub, target)
+        if not transfer:
+            return [None] * 12
+
+        hour_cols = [f"{h}시" for h in range(1, 25)]
+
+        # 대상선로 / 전환선로 데이터 필터
+        df_target = self.master_df[
+            (self.master_df["변전소명"] == sub) &
+            (self.master_df["회선명"] == target)
+        ].copy()
+
+        df_transfer = self.master_df[
+            (self.master_df["변전소명"] == sub) &
+            (self.master_df["회선명"] == transfer)
+        ].copy()
+
+        if df_target.empty and df_transfer.empty:
+            return [None] * 12
+
+        results = []
+        for month in range(1, 13):
+            # 해당 월 문자열 패턴
+            month_str = f"{self._year}{month:02d}"
+
+            dt = df_target[df_target["일자"].str.startswith(month_str)]
+            dtr = df_transfer[df_transfer["일자"].str.startswith(month_str)]
+
+            if dt.empty and dtr.empty:
+                results.append(None)
+                continue
+
+            # 날짜 기준 병합
+            merged = pd.merge(
+                dt[["일자"] + hour_cols],
+                dtr[["일자"] + hour_cols],
+                on="일자", how="outer",
+                suffixes=("_t", "_tr"),
+            )
+
+            possible_count = 0
+            for _, row in merged.iterrows():
+                max_sum = 0.0
+                for h in range(1, 25):
+                    t_val = row.get(f"{h}시_t", 0.0)
+                    tr_val = row.get(f"{h}시_tr", 0.0)
+                    t_val = float(t_val) if pd.notna(t_val) else 0.0
+                    tr_val = float(tr_val) if pd.notna(tr_val) else 0.0
+                    s = t_val + tr_val
+                    if s > max_sum:
+                        max_sum = s
+                if max_sum <= threshold:
+                    possible_count += 1
+
+            results.append(possible_count)
+
+        return results
+
+    def get_daily_detail(self, sub: str, target: str, month: int, threshold: float = OVERLOAD_THRESHOLD) -> list[dict]:
+        """
+        특정 월의 일별 상세 데이터를 반환.
+
+        Returns: [{
+            "day": int, "date_str": str,
+            "target_hours": [24 float], "transfer_hours": [24 float],
+            "sum_hours": [24 float],
+            "target_max": float, "transfer_max": float,
+            "sum_max": float, "possible": bool
+        }, ...]
+        """
+        if not self.has_data():
+            return []
+
+        transfer = self.get_transfer_line(sub, target)
+        hour_cols = [f"{h}시" for h in range(1, 25)]
+        month_str = f"{self._year}{month:02d}"
+
+        df_target = self.master_df[
+            (self.master_df["변전소명"] == sub) &
+            (self.master_df["회선명"] == target) &
+            (self.master_df["일자"].str.startswith(month_str))
+        ].copy()
+
+        df_transfer = pd.DataFrame()
+        if transfer:
+            df_transfer = self.master_df[
+                (self.master_df["변전소명"] == sub) &
+                (self.master_df["회선명"] == transfer) &
+                (self.master_df["일자"].str.startswith(month_str))
+            ].copy()
+
+        # 모든 일자 수집
+        all_dates = set()
+        if not df_target.empty:
+            all_dates.update(df_target["일자"].tolist())
+        if not df_transfer.empty:
+            all_dates.update(df_transfer["일자"].tolist())
+
+        if not all_dates:
+            return []
+
+        result = []
+        for date_str in sorted(all_dates):
+            t_row = df_target[df_target["일자"] == date_str]
+            tr_row = df_transfer[df_transfer["일자"] == date_str] if not df_transfer.empty else pd.DataFrame()
+
+            target_hours = []
+            transfer_hours = []
+            sum_hours = []
+
+            for h in range(1, 25):
+                col = f"{h}시"
+                t_val = float(t_row[col].iloc[0]) if not t_row.empty and pd.notna(t_row[col].iloc[0]) else 0.0
+                tr_val = float(tr_row[col].iloc[0]) if not tr_row.empty and pd.notna(tr_row[col].iloc[0]) else 0.0
+                target_hours.append(round(t_val, 2))
+                transfer_hours.append(round(tr_val, 2))
+                sum_hours.append(round(t_val + tr_val, 2))
+
+            sum_max = max(sum_hours) if sum_hours else 0.0
+
+            # 일자에서 day 추출
+            try:
+                day = int(date_str[6:8]) if len(date_str) >= 8 else 0
+            except ValueError:
+                day = 0
+
+            # 요일 자동 인식 (pd.to_datetime 활용, 연도 무관)
+            try:
+                dt_obj = pd.to_datetime(date_str, format="%Y%m%d")
+                weekday_num = dt_obj.weekday()  # 0=월 ~ 6=일
+                weekday_kr = self.WEEKDAY_KR[weekday_num]
+                is_weekend = weekday_num >= 5   # 토(5), 일(6)
+            except Exception:
+                weekday_kr = ""
+                is_weekend = False
+
+            result.append({
+                "day": day,
+                "date_str": date_str,
+                "weekday": weekday_kr,
+                "is_weekend": is_weekend,
+                "target_hours": target_hours,
+                "transfer_hours": transfer_hours,
+                "sum_hours": sum_hours,
+                "target_max": max(target_hours) if target_hours else 0.0,
+                "transfer_max": max(transfer_hours) if transfer_hours else 0.0,
+                "sum_max": round(sum_max, 2),
+                "possible": sum_max <= threshold,
+            })
+
+        return result
 
     def get_all_lines_data(self, sub: str) -> list[tuple[str, str, list]]:
+        """변전소 종합 조회: 모든 선로의 월별 가능 일수."""
         lines = self.substations.get(sub, [])
         result = []
         for target, transfer in lines:
-            monthly = self.results.get((sub, target), [None] * 12)
+            monthly = self.calc_monthly_possible_days(sub, target)
             result.append((target, transfer, monthly))
         return result
 
-    def get_daily_data(self, sub: str, target: str, month_idx: int) -> tuple[list, list]:
+    def get_month_actual_days(self, month: int) -> int:
+        """month(1-indexed)에 해당하는 월의 실제 일수."""
+        try:
+            return calendar.monthrange(self._year, month)[1]
+        except Exception:
+            return [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1]
+
+    # ─────────────────────────────────
+    #  예측 모델용 데이터프레임 (미래 ML 대비)
+    # ─────────────────────────────────
+    def get_ml_ready_df(self, sub: str = None, line: str = None) -> pd.DataFrame:
         """
-        ★★★ 핵심 데이터 매칭 규칙 ★★★
+        시계열 예측 모델이 바로 학습할 수 있는 깔끔한 DataFrame 반환.
 
-        [대상선로 부하]
-          → '일일 최대부하' 시트에서 (변전소명, 대상선로명)으로 행을 검색
+        구조:
+          - 인덱스: DatetimeIndex (날짜)
+          - 컬럼: 변전소명, 회선명, 1시~24시, 일최대, 요일, 요일번호, 주말, 연, 월, 일
+          - 결측치: 0으로 채움
+          - 정렬: 날짜 오름차순
 
-        [전환선로 부하]  ← ★★★ 주의 ★★★
-          → '전환선로 부하' 시트에서도 동일하게 (변전소명, '대상선로명')으로 행을 검색
-          → 전환선로명(예: '동X상')이 아니라, 대상선로명(예: '김X해')으로 찾는다!
-          → 이유: '전환선로 부하' 시트는 "대상선로 기준으로 해당 전환선로의 부하"를
-                  정리한 구조이기 때문
-
-        (예시)
-          대상선로='김X해', 전환선로='동X상' 일 때
-          - '일일 최대부하'  시트에서 회선명='김X해'인 행 → 대상선로 부하
-          - '전환선로 부하'  시트에서 회선명='김X해'인 행 → 전환선로 부하  (O)
-          - '전환선로 부하'  시트에서 회선명='동X상'인 행 → (X) 절대 아님!
+        Parameters:
+            sub: 특정 변전소만 필터 (None이면 전체)
+            line: 특정 회선만 필터 (None이면 전체)
         """
-        target_days = self.daily_target.get((sub, target, month_idx), [None] * 31)
-        transfer_days = self.daily_transfer.get((sub, target, month_idx), [None] * 31)
-        return target_days, transfer_days
+        if not self.has_data():
+            return pd.DataFrame()
 
-    def get_month_actual_days(self, month_idx: int) -> int:
-        """month_idx(0-indexed)에 해당하는 월의 실제 일수 반환"""
-        if month_idx < len(self.month_offsets):
-            return self.month_offsets[month_idx][1]
-        # 월 오프셋이 없으면 기본값
-        return [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month_idx]
+        df = self.master_df.copy()
 
-    def has_daily_data(self) -> bool:
-        """일별 부하 데이터가 로드되었는지 확인"""
-        return len(self.daily_target) > 0 or len(self.daily_transfer) > 0
+        # 필터
+        if sub:
+            df = df[df["변전소명"] == sub]
+        if line:
+            df = df[df["회선명"] == line]
+
+        if df.empty:
+            return pd.DataFrame()
+
+        # datetime 파싱 실패 행 제거
+        df = df.dropna(subset=["날짜"])
+
+        # 일최대 컬럼 추가
+        hour_cols = [f"{h}시" for h in range(1, 25)]
+        df["일최대"] = df[hour_cols].max(axis=1)
+
+        # 인덱스 설정 + 정렬
+        df = df.set_index("날짜").sort_index()
+
+        # 필요 컬럼만 유지
+        keep_cols = ["변전소명", "회선명"] + hour_cols + \
+                    ["일최대", "요일", "요일번호", "주말", "연", "월", "일"]
+        df = df[[c for c in keep_cols if c in df.columns]]
+
+        return df
+
+    # ─────────────────────────────────
+    #  연도별 하위 폴더 순회 로드 (AI 학습용)
+    # ─────────────────────────────────
+    def load_usage_multi_year(self, root_folder: str) -> tuple[bool, str]:
+        """
+        root_folder 아래 '2023년', '2024년' 등 연도 폴더를 순회하며
+        각 폴더 안의 1월~12월.xlsx 파일을 모두 병합.
+        기존 load_usage_folder 로직을 재활용한다.
+        """
+        year_dirs = []
+        try:
+            for name in sorted(os.listdir(root_folder)):
+                full = os.path.join(root_folder, name)
+                if os.path.isdir(full):
+                    # '2023년', '2024', '2025년' 등 숫자가 포함된 폴더
+                    digits = "".join(c for c in name if c.isdigit())
+                    if len(digits) == 4:
+                        year_dirs.append(full)
+        except Exception as e:
+            return False, f"폴더 탐색 실패: {e}"
+
+        if not year_dirs:
+            # 연도 폴더가 없으면 root 자체를 단일 폴더로 시도
+            return self.load_usage_folder(root_folder)
+
+        all_frames = []
+        errors = []
+        col_names = ["변전소명", "회선명", "일자"] + [f"{h}시" for h in range(1, 25)]
+
+        for ydir in year_dirs:
+            xlsx_files = sorted([
+                f for f in os.listdir(ydir)
+                if f.endswith(('.xlsx', '.xls')) and not f.startswith('~$')
+            ])
+            for fname in xlsx_files:
+                fpath = os.path.join(ydir, fname)
+                try:
+                    try:
+                        df = pd.read_excel(fpath, header=None, skiprows=4, engine="calamine")
+                    except Exception:
+                        df = pd.read_excel(fpath, header=None, skiprows=4)
+
+                    if df.shape[1] < 27:
+                        for _ in range(27 - df.shape[1]):
+                            df[df.shape[1]] = None
+                    elif df.shape[1] > 27:
+                        df = df.iloc[:, :27]
+
+                    df.columns = col_names
+                    df = df[df["회선명"].notna()].copy()
+                    df = df[df["회선명"].apply(lambda x: str(x).strip() not in ("", "회선명"))].copy()
+                    df["변전소명"] = df["변전소명"].ffill()
+                    df["변전소명"] = df["변전소명"].astype(str).str.strip().apply(self._unify_name)
+                    df["회선명"] = df["회선명"].astype(str).str.strip().apply(self._unify_name)
+                    df["일자"] = df["일자"].apply(self._normalize_date)
+                    for h in range(1, 25):
+                        col = f"{h}시"
+                        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+
+                    all_frames.append(df)
+                except Exception as e:
+                    errors.append(f"{fname}: {e}")
+
+        if not all_frames:
+            return False, f"유효한 데이터 없음. 오류: {'; '.join(errors)}"
+
+        self.master_df = pd.concat(all_frames, ignore_index=True)
+
+        # 시계열 전처리 (기존과 동일)
+        self.master_df["날짜"] = pd.to_datetime(
+            self.master_df["일자"], format="%Y%m%d", errors="coerce"
+        )
+        self.master_df["요일번호"] = self.master_df["날짜"].dt.weekday
+        self.master_df["요일"] = self.master_df["요일번호"].map(
+            lambda x: self.WEEKDAY_KR[int(x)] if pd.notna(x) else ""
+        )
+        self.master_df["주말"] = self.master_df["요일번호"].isin([5, 6])
+        self.master_df["연"] = self.master_df["날짜"].dt.year
+        self.master_df["월"] = self.master_df["날짜"].dt.month
+        self.master_df["일"] = self.master_df["날짜"].dt.day
+
+        try:
+            valid_years = self.master_df["연"].dropna()
+            if not valid_years.empty:
+                self._year = int(valid_years.max())
+        except Exception:
+            pass
+
+        n_files = len(all_frames)
+        n_years = len(year_dirs)
+        msg = f"{n_years}개 연도, {n_files}개 파일, {len(self.master_df):,}건 로드 완료"
+        if errors:
+            msg += f" (오류 {len(errors)}건)"
+        return True, msg
+
+
+# ═══════════════════════════════════════════════════════════════
+#  AI 부하량 예측 엔진 (XGBoost)
+# ═══════════════════════════════════════════════════════════════
+class LoadPredictor:
+    """
+    XGBoost 기반 익일 전력 부하량(1~24시) 예측 모델.
+
+    ■ 피처: 월, 일, 요일, 주말 여부, 전일 1~24시 부하(Lag-1), 전일 일최대
+    ■ 타겟: 당일 1~24시 부하 (24개 개별 모델 또는 MultiOutput)
+    ■ 학습: 특정 회선의 전체 일별 데이터로 학습
+    """
+
+    HOUR_COLS = [f"{h}시" for h in range(1, 25)]
+
+    def __init__(self):
+        self.models: dict = {}       # {hour_col: XGBRegressor}
+        self.is_trained: bool = False
+        self.train_line: str = ""
+        self.train_sub: str = ""
+        self.last_date: pd.Timestamp = None
+        self.train_df: pd.DataFrame = None   # 학습에 사용된 원본
+        self._train_msg: str = ""
+
+    def train(self, dm: DataManager, sub: str, line: str) -> tuple[bool, str]:
+        """특정 변전소/회선의 데이터로 24개 XGBoost 모델 학습."""
+        self.is_trained = False
+        self.models = {}
+
+        df = dm.get_ml_ready_df(sub, line)
+        if df.empty or len(df) < 14:
+            return False, f"학습 데이터 부족 (최소 14일 필요, 현재 {len(df)}일)"
+
+        # 일별 1행으로 정리 (중복 날짜 시 평균)
+        df = df.groupby(df.index).mean(numeric_only=True)
+        df = df.sort_index()
+
+        # Lag 피처 생성 (전일 부하)
+        for hc in self.HOUR_COLS:
+            df[f"lag1_{hc}"] = df[hc].shift(1)
+        df["lag1_일최대"] = df["일최대"].shift(1)
+
+        # 첫 행(lag 없음) 제거
+        df = df.dropna(subset=[f"lag1_1시"])
+
+        # 피처 컬럼
+        feature_cols = ["월", "일", "요일번호"] + \
+                       [f"lag1_{hc}" for hc in self.HOUR_COLS] + \
+                       ["lag1_일최대"]
+        # 주말 피처 (bool → int)
+        if "주말" in df.columns:
+            df["주말_int"] = df["주말"].astype(int)
+            feature_cols.append("주말_int")
+
+        X = df[feature_cols].values
+        self.train_df = df
+        self.last_date = df.index.max()
+        self.train_line = line
+        self.train_sub = sub
+
+        # 24개 시간대별 모델 학습
+        for hc in self.HOUR_COLS:
+            y = df[hc].values
+            model = XGBRegressor(
+                n_estimators=200,
+                max_depth=5,
+                learning_rate=0.08,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                random_state=42,
+                verbosity=0,
+            )
+            model.fit(X, y)
+            self.models[hc] = model
+
+        self.is_trained = True
+        n_days = len(df)
+        date_range = f"{df.index.min().strftime('%Y-%m-%d')} ~ {df.index.max().strftime('%Y-%m-%d')}"
+        self._train_msg = f"{sub}/{line} | {n_days}일 학습 완료 ({date_range})"
+        return True, self._train_msg
+
+    def predict_next_day(self) -> dict | None:
+        """학습된 모델로 마지막 날짜 다음 날 1~24시 부하 예측."""
+        if not self.is_trained or self.train_df is None:
+            return None
+
+        df = self.train_df
+        last_row = df.iloc[-1]
+        next_date = self.last_date + timedelta(days=1)
+
+        # 피처 구성 (다음 날 예측)
+        features = {
+            "월": next_date.month,
+            "일": next_date.day,
+            "요일번호": next_date.weekday(),
+        }
+        # lag = 오늘(마지막 날) 부하
+        for hc in self.HOUR_COLS:
+            features[f"lag1_{hc}"] = last_row[hc]
+        features["lag1_일최대"] = last_row["일최대"]
+        if "주말_int" in df.columns:
+            features["주말_int"] = 1 if next_date.weekday() >= 5 else 0
+
+        feature_cols = ["월", "일", "요일번호"] + \
+                       [f"lag1_{hc}" for hc in self.HOUR_COLS] + \
+                       ["lag1_일최대"]
+        if "주말_int" in df.columns:
+            feature_cols.append("주말_int")
+
+        X_pred = np.array([[features[c] for c in feature_cols]])
+
+        pred_hours = []
+        for hc in self.HOUR_COLS:
+            val = float(self.models[hc].predict(X_pred)[0])
+            pred_hours.append(round(max(val, 0.0), 2))
+
+        weekday_kr = DataManager.WEEKDAY_KR[next_date.weekday()]
+        return {
+            "date": next_date,
+            "date_str": next_date.strftime("%Y%m%d"),
+            "weekday": weekday_kr,
+            "is_weekend": next_date.weekday() >= 5,
+            "pred_hours": pred_hours,
+            "pred_max": round(max(pred_hours), 2),
+        }
+
+    def predict_date(self, target_date: pd.Timestamp) -> dict | None:
+        """임의의 미래 날짜에 대해 예측 (반복 예측으로 중간 lag 전파)."""
+        if not self.is_trained or self.train_df is None:
+            return None
+
+        df = self.train_df
+        current_last = self.last_date
+        current_hours = {hc: df.iloc[-1][hc] for hc in self.HOUR_COLS}
+        current_max = df.iloc[-1]["일최대"]
+
+        feature_cols = ["월", "일", "요일번호"] + \
+                       [f"lag1_{hc}" for hc in self.HOUR_COLS] + \
+                       ["lag1_일최대"]
+        if "주말_int" in df.columns:
+            feature_cols.append("주말_int")
+
+        # 하루씩 전파하며 예측
+        cursor = current_last + timedelta(days=1)
+        while cursor <= target_date:
+            features = {
+                "월": cursor.month,
+                "일": cursor.day,
+                "요일번호": cursor.weekday(),
+            }
+            for hc in self.HOUR_COLS:
+                features[f"lag1_{hc}"] = current_hours[hc]
+            features["lag1_일최대"] = current_max
+            if "주말_int" in df.columns:
+                features["주말_int"] = 1 if cursor.weekday() >= 5 else 0
+
+            X_pred = np.array([[features[c] for c in feature_cols]])
+            pred = {}
+            for hc in self.HOUR_COLS:
+                val = float(self.models[hc].predict(X_pred)[0])
+                pred[hc] = round(max(val, 0.0), 2)
+
+            current_hours = pred
+            current_max = max(pred.values())
+            cursor += timedelta(days=1)
+
+        weekday_kr = DataManager.WEEKDAY_KR[target_date.weekday()]
+        pred_hours = [current_hours[hc] for hc in self.HOUR_COLS]
+        return {
+            "date": target_date,
+            "date_str": target_date.strftime("%Y%m%d"),
+            "weekday": weekday_kr,
+            "is_weekend": target_date.weekday() >= 5,
+            "pred_hours": pred_hours,
+            "pred_max": round(max(pred_hours), 2),
+        }
+
+    def predict_year(self, target_year: int) -> dict | None:
+        """
+        target_year 전체 365(또는 366)일을 한 번에 효율적으로 예측.
+
+        마지막 학습일 → target_year 12/31까지 순차 roll-forward 하되,
+        target_year에 해당하는 날짜만 결과 dict에 저장.
+
+        Returns: {
+            "YYYYMMDD": {
+                "pred_hours": [24 floats],
+                "pred_max": float,
+                "weekday": str,
+                "is_weekend": bool,
+            }, ...
+        }
+        """
+        if not self.is_trained or self.train_df is None:
+            return None
+
+        df = self.train_df
+        current_hours = {hc: df.iloc[-1][hc] for hc in self.HOUR_COLS}
+        current_max = df.iloc[-1]["일최대"]
+
+        feature_cols = ["월", "일", "요일번호"] + \
+                       [f"lag1_{hc}" for hc in self.HOUR_COLS] + \
+                       ["lag1_일최대"]
+        has_weekend = "주말_int" in df.columns
+        if has_weekend:
+            feature_cols.append("주말_int")
+
+        # target_year의 시작~끝
+        year_start = pd.Timestamp(target_year, 1, 1)
+        year_end = pd.Timestamp(target_year, 12, 31)
+
+        # 학습 마지막 날짜 다음날부터 roll-forward
+        cursor = self.last_date + timedelta(days=1)
+        results = {}
+
+        while cursor <= year_end:
+            features = {
+                "월": cursor.month,
+                "일": cursor.day,
+                "요일번호": cursor.weekday(),
+            }
+            for hc in self.HOUR_COLS:
+                features[f"lag1_{hc}"] = current_hours[hc]
+            features["lag1_일최대"] = current_max
+            if has_weekend:
+                features["주말_int"] = 1 if cursor.weekday() >= 5 else 0
+
+            X_pred = np.array([[features[c] for c in feature_cols]])
+            pred = {}
+            for hc in self.HOUR_COLS:
+                val = float(self.models[hc].predict(X_pred)[0])
+                pred[hc] = round(max(val, 0.0), 2)
+
+            current_hours = pred
+            current_max = max(pred.values())
+
+            # target_year에 해당하는 날짜만 저장
+            if cursor >= year_start:
+                date_str = cursor.strftime("%Y%m%d")
+                weekday_kr = DataManager.WEEKDAY_KR[cursor.weekday()]
+                pred_hours = [pred[hc] for hc in self.HOUR_COLS]
+                results[date_str] = {
+                    "pred_hours": pred_hours,
+                    "pred_max": round(max(pred_hours), 2),
+                    "weekday": weekday_kr,
+                    "is_weekend": cursor.weekday() >= 5,
+                }
+
+            cursor += timedelta(days=1)
+
+        return results if results else None
 
 
 # ═══════════════════════════════════════════════════════════════
 #  색상 판정 유틸리티
 # ═══════════════════════════════════════════════════════════════
 def get_level_info(days, C: dict) -> dict:
-    """일수에 따른 색상/텍스트 정보를 딕셔너리로 반환"""
     if days is None:
         return {"border": C["nodata"], "bg": C["nodata_light"], "cell": C["nodata_cell"],
                 "color": C["nodata"], "badge": C["nodata"],
@@ -386,19 +959,21 @@ class App(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.dm = DataManager()
+        self.predictor = LoadPredictor()
+        self.threshold = OVERLOAD_THRESHOLD  # 사용자 설정 가능 임계값
+        self._pred_cache = {}  # {(sub, target): {year, target_preds, transfer_preds}}
         self.is_dark = False
         self.C = LIGHT
         ctk.set_appearance_mode("light")
         ctk.set_default_color_theme("blue")
-        self._setup_window()
-        self._build_ui()
-        # 현재 조회 중인 선로 정보 (팝업에서 사용)
         self._current_sub = ""
         self._current_target = ""
         self._current_transfer = ""
+        self._setup_window()
+        self._build_ui()
 
     def _setup_window(self):
-        self.title("배전선로 휴전 가능월 검토 프로그램")
+        self.title("배전선로 휴전 가능월 검토 프로그램 v9 — AI 예측")
         self.geometry("1340x920")
         self.minsize(1140, 820)
         self.configure(fg_color=self.C["bg"])
@@ -440,7 +1015,7 @@ class App(ctk.CTk):
         )
         self.theme_btn.pack(side="right", padx=14)
 
-        # ═══ 데이터 로드 카드 (탭 바깥 — 항상 표시) ═══
+        # ═══ 데이터 로드 카드 ═══
         load_card = ctk.CTkFrame(self, fg_color=C["card_bg"], corner_radius=10)
         load_card.pack(fill="x", padx=14, pady=(8, 4))
 
@@ -450,50 +1025,73 @@ class App(ctk.CTk):
             text_color=C["text"],
         ).grid(row=0, column=0, padx=14, pady=(8, 2), sticky="w", columnspan=3)
 
-        # 종합 결과 엑셀
+        # ① 전환선로 매핑 파일
         ctk.CTkLabel(
-            load_card, text="종합 결과 엑셀 :",
-            font=ctk.CTkFont(family=FONT_FAMILY, size=12), text_color=C["text_sub"],
+            load_card, text="전환선로 매핑 파일 :",
+            font=ctk.CTkFont(family=FONT_FAMILY, size=12), text_color=C["text"],
         ).grid(row=1, column=0, padx=(14, 6), pady=4, sticky="e")
 
-        self.excel_var = ctk.StringVar(value="파일을 선택하세요")
+        self.mapping_var = ctk.StringVar(value="파일을 선택하세요")
         ctk.CTkEntry(
-            load_card, textvariable=self.excel_var, width=620,
+            load_card, textvariable=self.mapping_var, width=620,
             font=ctk.CTkFont(family=FONT_FAMILY, size=11),
             state="readonly", fg_color=C["entry_bg"], text_color=C["text"],
         ).grid(row=1, column=1, padx=4, pady=4, sticky="w")
 
         ctk.CTkButton(
-            load_card, text="파일 선택", width=100, height=30,
+            load_card, text="📂 파일 선택", width=130, height=30,
             font=ctk.CTkFont(family=FONT_FAMILY, size=12),
-            command=self._on_select_excel,
+            command=self._on_select_mapping,
         ).grid(row=1, column=2, padx=8, pady=4)
 
-        # 사용량 폴더 (비활성)
+        # ② 과거 부하량 데이터 폴더
         ctk.CTkLabel(
-            load_card, text="사용량 폴더 :",
-            font=ctk.CTkFont(family=FONT_FAMILY, size=12), text_color=C["nodata"],
+            load_card, text="과거 부하량 데이터 폴더 :",
+            font=ctk.CTkFont(family=FONT_FAMILY, size=12), text_color=C["text"],
         ).grid(row=2, column=0, padx=(14, 6), pady=4, sticky="e")
 
+        self.usage_var = ctk.StringVar(value="폴더를 선택하세요 (연도별 하위 폴더 또는 단일 폴더)")
         ctk.CTkEntry(
-            load_card, width=620,
+            load_card, textvariable=self.usage_var, width=620,
             font=ctk.CTkFont(family=FONT_FAMILY, size=11),
-            state="disabled", fg_color=C["entry_bg"],
-            placeholder_text="(추후 일별 분석 시 사용 예정)",
+            state="readonly", fg_color=C["entry_bg"], text_color=C["text"],
         ).grid(row=2, column=1, padx=4, pady=4, sticky="w")
 
         ctk.CTkButton(
-            load_card, text="폴더 선택", width=100, height=30,
+            load_card, text="📁 폴더 선택", width=130, height=30,
             font=ctk.CTkFont(family=FONT_FAMILY, size=12),
-            state="disabled",
+            command=self._on_select_usage_folder,
         ).grid(row=2, column=2, padx=8, pady=4)
+
+        # ③ 판정 기준값 (임계값)
+        ctk.CTkLabel(
+            load_card, text="판정 기준값 (합산 부하) :",
+            font=ctk.CTkFont(family=FONT_FAMILY, size=12), text_color=C["text"],
+        ).grid(row=3, column=0, padx=(14, 6), pady=4, sticky="e")
+
+        threshold_fr = tk.Frame(load_card, bg=C["card_bg"])
+        threshold_fr.grid(row=3, column=1, padx=4, pady=4, sticky="w")
+
+        self.threshold_var = ctk.StringVar(value=str(self.threshold))
+        self.threshold_entry = ctk.CTkEntry(
+            threshold_fr, textvariable=self.threshold_var, width=100,
+            font=ctk.CTkFont(family=FONT_FAMILY, size=12),
+            fg_color=C["entry_bg"], text_color=C["text"],
+        )
+        self.threshold_entry.pack(side="left")
+
+        ctk.CTkLabel(
+            threshold_fr,
+            text="  (합산 최대 부하 ≤ 기준값 → 가능(O), 초과 → 불가(X))",
+            font=ctk.CTkFont(family=FONT_FAMILY, size=11), text_color=C["text_sub"],
+        ).pack(side="left", padx=(8, 0))
 
         # 로드 상태
         self.status_var = ctk.StringVar(value="")
         ctk.CTkLabel(
             load_card, textvariable=self.status_var,
             font=ctk.CTkFont(family=FONT_FAMILY, size=11), text_color=C["ok"],
-        ).grid(row=3, column=0, columnspan=3, padx=14, pady=(0, 6), sticky="w")
+        ).grid(row=4, column=0, columnspan=3, padx=14, pady=(0, 6), sticky="w")
 
         load_card.columnconfigure(1, weight=1)
 
@@ -519,7 +1117,6 @@ class App(ctk.CTk):
     def _build_tab1(self, parent):
         C = self.C
 
-        # ── 조건 선택 영역 ──
         filter_fr = ctk.CTkFrame(parent, fg_color=C["card_bg"], corner_radius=8)
         filter_fr.pack(fill="x", padx=6, pady=(6, 4))
 
@@ -529,7 +1126,6 @@ class App(ctk.CTk):
             text_color=C["text"],
         ).grid(row=0, column=0, padx=10, pady=(8, 4), sticky="w", columnspan=8)
 
-        # 변전소
         ctk.CTkLabel(filter_fr, text="변전소",
                      font=ctk.CTkFont(family=FONT_FAMILY, size=12, weight="bold"),
                      text_color=C["text"],
@@ -544,7 +1140,6 @@ class App(ctk.CTk):
         )
         self.t1_sub_combo.grid(row=1, column=1, padx=4, pady=8, sticky="w")
 
-        # 휴전선로
         ctk.CTkLabel(filter_fr, text="휴전선로(대상)",
                      font=ctk.CTkFont(family=FONT_FAMILY, size=12, weight="bold"),
                      text_color=C["text"],
@@ -559,7 +1154,6 @@ class App(ctk.CTk):
         )
         self.t1_target_combo.grid(row=1, column=3, padx=4, pady=8, sticky="w")
 
-        # 전환선로
         ctk.CTkLabel(filter_fr, text="전환선로",
                      font=ctk.CTkFont(family=FONT_FAMILY, size=12, weight="bold"),
                      text_color=C["text"],
@@ -572,7 +1166,6 @@ class App(ctk.CTk):
             text_color=C["highlight"], fg_color=C["highlight_bg"], corner_radius=6,
         ).grid(row=1, column=5, padx=4, pady=8, sticky="w")
 
-        # 결과 조회 버튼
         ctk.CTkButton(
             filter_fr, text="  결과 조회", width=130, height=36,
             font=ctk.CTkFont(family=FONT_FAMILY, size=13, weight="bold"),
@@ -582,11 +1175,10 @@ class App(ctk.CTk):
 
         filter_fr.columnconfigure(7, weight=1)
 
-        # ── 결과 영역 (범례 + 대시보드) ──
+        # ── 결과 영역 ──
         result_fr = ctk.CTkFrame(parent, fg_color=C["card_bg"], corner_radius=8)
         result_fr.pack(fill="both", expand=True, padx=6, pady=(4, 6))
 
-        # 범례 + 요약 행
         leg_row = tk.Frame(result_fr, bg=C["card_bg"])
         leg_row.pack(fill="x", padx=12, pady=(8, 4))
 
@@ -605,7 +1197,6 @@ class App(ctk.CTk):
             font=ctk.CTkFont(family=FONT_FAMILY, size=11), text_color=C["text_sub"],
         ).pack(side="right", padx=4)
 
-        # 대시보드 컨테이너
         self.t1_dashboard = ctk.CTkFrame(result_fr, fg_color=C["card_bg"])
         self.t1_dashboard.pack(fill="both", expand=True, padx=10, pady=(0, 8))
 
@@ -621,7 +1212,6 @@ class App(ctk.CTk):
     def _build_tab2(self, parent):
         C = self.C
 
-        # ── 조건 선택 ──
         filter_fr = ctk.CTkFrame(parent, fg_color=C["card_bg"], corner_radius=8)
         filter_fr.pack(fill="x", padx=6, pady=(6, 4))
 
@@ -652,7 +1242,6 @@ class App(ctk.CTk):
             command=self._t2_on_run,
         ).grid(row=1, column=2, padx=(20, 10), pady=8)
 
-        # 요약
         self.t2_summary_var = ctk.StringVar(value="")
         ctk.CTkLabel(
             filter_fr, textvariable=self.t2_summary_var,
@@ -677,29 +1266,149 @@ class App(ctk.CTk):
             tk.Label(leg, text=label, font=(FONT_FAMILY, 10),
                      bg=C["card_bg"], fg=C["text_sub"]).pack(side="left", padx=(0, 14))
 
-        # 클릭 안내 라벨
         tk.Label(leg, text="※ 대상선로를 클릭하면 상세 조회로 이동합니다",
                  font=(FONT_FAMILY, 10), bg=C["card_bg"], fg=C["accent"],
         ).pack(side="right", padx=8)
 
-        # ── 고정 헤더 영역 (스크롤 밖 — 틀고정) ──
+        # ── 고정 헤더 ──
         self.t2_header_fr = tk.Frame(parent, bg=C["card_bg"])
-        self.t2_header_fr.pack(fill="x", padx=(6, 6), pady=(4, 0))
+        self.t2_header_fr.pack(fill="x", padx=6, pady=(4, 0))
 
-        # ── 결과 그리드 영역 (ScrollableFrame — 데이터만 스크롤) ──
+        # ── 스크롤 데이터 ──
         self.t2_scroll = ctk.CTkScrollableFrame(
             parent, fg_color=C["card_bg"], corner_radius=8,
             label_text="", label_fg_color=C["card_bg"],
         )
         self.t2_scroll.pack(fill="both", expand=True, padx=6, pady=(0, 6))
 
-        # 초기 안내
         self.t2_placeholder = ctk.CTkLabel(
             self.t2_scroll,
             text="변전소를 선택한 후  [ 전체 조회 ]  버튼을 눌러주세요.",
             font=ctk.CTkFont(family=FONT_FAMILY, size=13), text_color=C["text_sub"],
         )
         self.t2_placeholder.pack(pady=40)
+
+    # ══════════════════════════════════
+    #  데이터 로드 이벤트
+    # ══════════════════════════════════
+    def _on_select_mapping(self):
+        path = filedialog.askopenfilename(
+            title="전환선로 매핑 파일 선택",
+            filetypes=[("Excel", "*.xlsx *.xls"), ("All", "*.*")],
+        )
+        if not path:
+            return
+        self.mapping_var.set(path)
+        ok, msg = self.dm.load_mapping(path)
+
+        if ok:
+            self.status_var.set(f"  매핑: {msg}")
+            subs = self.dm.get_substation_list()
+            self.t1_sub_combo.configure(values=subs)
+            if subs:
+                self.t1_sub_combo.set(subs[0])
+                self._t1_on_sub(subs[0])
+            self.t2_sub_combo.configure(values=subs)
+            if subs:
+                self.t2_sub_combo.set(subs[0])
+        else:
+            self.status_var.set(f"  오류: {msg}")
+            messagebox.showerror("매핑 로드 오류", msg)
+
+    def _on_select_usage_folder(self):
+        folder = filedialog.askdirectory(title="과거 부하량 데이터 폴더 선택")
+        if not folder:
+            return
+        self.usage_var.set(folder)
+        self.status_var.set("  데이터 로딩 중...")
+        self.update_idletasks()
+
+        ok, msg = self.dm.load_usage_multi_year(folder)
+        if ok:
+            prev = self.status_var.get().replace("  데이터 로딩 중...", "").strip()
+            base = prev if prev and "매핑" in prev else ""
+            self.status_var.set(f"  {base}  |  데이터: {msg}" if base else f"  데이터: {msg}")
+            # 예측 캐시 초기화 (새 데이터 로드 시)
+            self._pred_cache = {}
+        else:
+            self.status_var.set(f"  오류: {msg}")
+            messagebox.showerror("데이터 로드 오류", msg)
+
+    def _get_threshold(self) -> float:
+        """임계값 Entry에서 현재 값을 읽어 반환."""
+        try:
+            val = float(self.threshold_var.get())
+            if val <= 0:
+                raise ValueError
+            self.threshold = val
+            return val
+        except (ValueError, AttributeError):
+            self.threshold = OVERLOAD_THRESHOLD
+            return OVERLOAD_THRESHOLD
+
+    def _train_and_predict_year(self, sub: str, target: str) -> dict | None:
+        """대상선로 + 전환선로 각각 XGBoost 학습 → Target Year 전체 예측."""
+        if not self.dm.has_data():
+            messagebox.showwarning("알림", "과거 부하량 데이터를 먼저 로드해주세요.")
+            return None
+
+        transfer = self.dm.get_transfer_line(sub, target)
+        if not transfer:
+            messagebox.showwarning("알림", f"'{target}'의 전환선로를 찾을 수 없습니다.")
+            return None
+
+        last_year = self.dm._year
+        target_year = last_year + 1
+
+        # 캐시 확인
+        cache_key = (sub, target)
+        if cache_key in self._pred_cache and self._pred_cache[cache_key]["year"] == target_year:
+            return self._pred_cache[cache_key]
+
+        self.status_var.set(f"  AI 학습 중... ({sub}/{target})")
+        self.update_idletasks()
+
+        # 대상선로 학습 + 예측
+        pred_target = LoadPredictor()
+        ok, msg = pred_target.train(self.dm, sub, target)
+        if not ok:
+            self.status_var.set(f"  대상선로 학습 실패: {msg}")
+            messagebox.showerror("AI 학습 오류", f"대상선로({target}): {msg}")
+            return None
+
+        self.status_var.set(f"  대상선로 학습 완료. 전환선로 학습 중... ({sub}/{transfer})")
+        self.update_idletasks()
+
+        # 전환선로 학습 + 예측
+        pred_transfer = LoadPredictor()
+        ok, msg = pred_transfer.train(self.dm, sub, transfer)
+        if not ok:
+            self.status_var.set(f"  전환선로 학습 실패: {msg}")
+            messagebox.showerror("AI 학습 오류", f"전환선로({transfer}): {msg}")
+            return None
+
+        self.status_var.set(f"  {target_year}년 예측 계산 중...")
+        self.update_idletasks()
+
+        # Target Year 전체 예측
+        target_preds = pred_target.predict_year(target_year)
+        transfer_preds = pred_transfer.predict_year(target_year)
+
+        if not target_preds or not transfer_preds:
+            self.status_var.set("  예측 실패")
+            messagebox.showerror("예측 오류", "연간 예측 생성에 실패했습니다.")
+            return None
+
+        result = {
+            "year": target_year,
+            "target_preds": target_preds,
+            "transfer_preds": transfer_preds,
+        }
+        self._pred_cache[cache_key] = result
+
+        self.status_var.set(
+            f"  AI 예측 완료 | {target_year}년 | {sub}/{target} → {transfer}")
+        return result
 
     # ══════════════════════════════════
     #  탭 1 이벤트 핸들러
@@ -720,65 +1429,118 @@ class App(ctk.CTk):
         self.t1_transfer_var.set(tr if tr else "—")
 
     def _t1_on_run(self):
-        sub    = self.t1_sub_combo.get()
+        sub = self.t1_sub_combo.get()
         target = self.t1_target_combo.get()
         transfer = self.t1_transfer_var.get()
 
         if not self.dm.substations:
-            messagebox.showwarning("알림", "종합 결과 엑셀 파일을 먼저 로드해주세요.")
+            messagebox.showwarning("알림", "전환선로 매핑 파일을 먼저 로드해주세요.")
+            return
+        if not self.dm.has_data():
+            messagebox.showwarning("알림", "과거 부하량 데이터를 먼저 로드해주세요.")
             return
         if target in ("(선로 없음)", "변전소를 선택하세요"):
             messagebox.showwarning("알림", "휴전선로(대상선로)를 선택해주세요.")
             return
 
-        monthly = self.dm.get_monthly_days(sub, target)
-        # 현재 선로 정보 저장 (팝업에서 참조)
         self._current_sub = sub
         self._current_target = target
         self._current_transfer = transfer
-        self._t1_render(monthly, sub, target, transfer)
 
-    # ── 탭 1 대시보드 렌더링 ──
-    def _t1_render(self, monthly: list, sub: str, target: str, transfer: str):
+        # 임계값 읽기
+        threshold = self._get_threshold()
+
+        # 계산 중 표시
+        for w in self.t1_dashboard.winfo_children():
+            w.destroy()
+        ctk.CTkLabel(
+            self.t1_dashboard, text="AI 학습 및 예측 중... (잠시 기다려주세요)",
+            font=ctk.CTkFont(family=FONT_FAMILY, size=14), text_color=self.C["text_sub"],
+        ).place(relx=0.5, rely=0.5, anchor="center")
+        self.update_idletasks()
+
+        # AI 학습 + 예측
+        pred_result = self._train_and_predict_year(sub, target)
+        if pred_result is None:
+            for w in self.t1_dashboard.winfo_children():
+                w.destroy()
+            ctk.CTkLabel(
+                self.t1_dashboard, text="예측 실패. 데이터를 확인해주세요.",
+                font=ctk.CTkFont(family=FONT_FAMILY, size=14), text_color=self.C["ng"],
+            ).place(relx=0.5, rely=0.5, anchor="center")
+            return
+
+        target_year = pred_result["year"]
+        target_preds = pred_result["target_preds"]
+        transfer_preds = pred_result["transfer_preds"]
+
+        # 월별 가능 일수 계산 (예측 기반)
+        monthly = self._calc_predicted_monthly(
+            target_year, target_preds, transfer_preds, threshold)
+        self._t1_render(monthly, sub, target, transfer, target_year)
+
+    def _calc_predicted_monthly(self, target_year: int,
+                                 target_preds: dict, transfer_preds: dict,
+                                 threshold: float) -> list:
+        """예측 결과에서 월별 절체 가능 일수를 계산."""
+        results = []
+        for month in range(1, 13):
+            n_days = calendar.monthrange(target_year, month)[1]
+            possible_count = 0
+            has_data = False
+            for day in range(1, n_days + 1):
+                date_str = f"{target_year}{month:02d}{day:02d}"
+                t_pred = target_preds.get(date_str)
+                tr_pred = transfer_preds.get(date_str)
+                if t_pred and tr_pred:
+                    has_data = True
+                    sum_hours = [t + tr for t, tr in
+                                 zip(t_pred["pred_hours"], tr_pred["pred_hours"])]
+                    sum_max = max(sum_hours)
+                    if sum_max <= threshold:
+                        possible_count += 1
+            results.append(possible_count if has_data else None)
+        return results
+
+    def _t1_render(self, monthly: list, sub: str, target: str, transfer: str,
+                   target_year: int = None):
         C = self.C
         for w in self.t1_dashboard.winfo_children():
             w.destroy()
 
-        # 요약
-        ok_c  = sum(1 for d in monthly if d is not None and d >= LEVEL_HIGH)
-        wa_c  = sum(1 for d in monthly if d is not None and LEVEL_MID <= d < LEVEL_HIGH)
-        ng_c  = sum(1 for d in monthly if d is not None and d < LEVEL_MID)
-        nd_c  = sum(1 for d in monthly if d is None)
+        year_tag = f"  ({target_year}년 AI 예측)" if target_year else ""
+        ok_c = sum(1 for d in monthly if d is not None and d >= LEVEL_HIGH)
+        wa_c = sum(1 for d in monthly if d is not None and LEVEL_MID <= d < LEVEL_HIGH)
+        ng_c = sum(1 for d in monthly if d is not None and d < LEVEL_MID)
+        nd_c = sum(1 for d in monthly if d is None)
         self.t1_summary_var.set(
-            f"{sub}  |  {target} → {transfer}      "
+            f"{sub}  |  {target} → {transfer}{year_tag}      "
             f"[ 유력 {ok_c}  /  고려 {wa_c}  /  불가 {ng_c}"
             + (f"  /  없음 {nd_c}" if nd_c else "") + " ]"
         )
 
-        # ── 절체 가능 일수 테이블 + 🔍 상세 버튼 ──
-        self._t1_render_table(monthly, sub, target, transfer)
+        self._t1_render_table(monthly, sub, target, transfer, target_year)
 
-    def _t1_render_table(self, monthly: list, sub: str, target: str, transfer: str):
+    def _t1_render_table(self, monthly: list, sub: str, target: str, transfer: str,
+                         target_year: int = None):
         C = self.C
+        year_label = f"  {target_year}년 AI 예측 — 절체 가능 일수" if target_year else "  절체 가능 일수"
 
-        # ── "절체 가능 일수" 타이틀 ──
         title_bar = tk.Frame(self.t1_dashboard, bg=C["accent"])
         title_bar.pack(fill="x", padx=2, pady=(6, 0))
-        tk.Label(title_bar, text="  절체 가능 일수", font=(FONT_FAMILY, 12, "bold"),
+        tk.Label(title_bar, text=year_label, font=(FONT_FAMILY, 12, "bold"),
                  bg=C["accent"], fg="#ffffff",
         ).pack(side="left", padx=4, pady=3)
-        tk.Label(title_bar, text="※ 🔍 버튼을 클릭하면 일별 상세 사용량을 조회할 수 있습니다  ",
+        tk.Label(title_bar, text="※ 🔍 버튼을 클릭하면 일별 AI 예측 부하를 상세 조회합니다  ",
                  font=(FONT_FAMILY, 10), bg=C["accent"], fg="#d0e8ff",
         ).pack(side="right", padx=4, pady=3)
 
-        # ── Grid 테이블 ──
         wrap = tk.Frame(self.t1_dashboard, bg=C["card_bg"])
         wrap.pack(fill="both", expand=True, padx=2, pady=(0, 2))
 
         grid = tk.Frame(wrap, bg=C["card_bg"])
         grid.pack(fill="both", expand=True, padx=4, pady=4)
 
-        # 헤더 행
         headers = [("월", 6), ("절체 가능 일수", 14), ("판정", 10), ("상세", 6)]
         for col, (txt, w) in enumerate(headers):
             tk.Label(grid, text=txt, font=(FONT_FAMILY, 11, "bold"),
@@ -786,7 +1548,6 @@ class App(ctk.CTk):
                      width=w, height=2, relief="flat",
             ).grid(row=0, column=col, padx=(0, 1), pady=(0, 1), sticky="nsew")
 
-        # 데이터 행 (1~12월)
         for i in range(12):
             row_num = i + 1
             d = monthly[i]
@@ -794,36 +1555,31 @@ class App(ctk.CTk):
             d_str = f"{d}일" if d is not None else "—"
             row_bg = info["bg"]
 
-            # 월
             tk.Label(grid, text=f"{i+1}월", font=(FONT_FAMILY, 11, "bold"),
                      bg=row_bg, fg=C["text"],
                      width=6, height=2, anchor="center", relief="flat",
             ).grid(row=row_num, column=0, padx=(0, 1), pady=(0, 1), sticky="nsew")
 
-            # 절체 가능 일수
             tk.Label(grid, text=d_str, font=(FONT_FAMILY, 13, "bold"),
                      bg=row_bg, fg=info["color"],
                      width=14, height=2, anchor="center", relief="flat",
             ).grid(row=row_num, column=1, padx=(0, 1), pady=(0, 1), sticky="nsew")
 
-            # 판정
             tk.Label(grid, text=f'{info["icon"]}  {info["level"]}',
                      font=(FONT_FAMILY, 11, "bold"),
                      bg=row_bg, fg=info["color"],
                      width=10, height=2, anchor="center", relief="flat",
             ).grid(row=row_num, column=2, padx=(0, 1), pady=(0, 1), sticky="nsew")
 
-            # 🔍 상세 버튼 — 클릭 시 일별 상세 사용량 팝업 호출
             btn = tk.Button(
                 grid, text="🔍 상세", font=(FONT_FAMILY, 10),
                 bg=C["accent"], fg="#ffffff", activebackground=C["accent_hover"],
                 activeforeground="#ffffff", relief="flat", cursor="hand2",
-                command=lambda m=i, s=sub, t=target, tr=transfer:
-                    self._open_daily_popup(s, t, tr, m),
+                command=lambda m=i, s=sub, t=target, tr=transfer, ty=target_year:
+                    self._open_daily_popup(s, t, tr, m + 1, ty),
             )
             btn.grid(row=row_num, column=3, padx=(2, 1), pady=(1, 1), sticky="nsew")
 
-        # 열 균등 분배
         grid.columnconfigure(0, weight=1, uniform="t1")
         grid.columnconfigure(1, weight=3, uniform="t1")
         grid.columnconfigure(2, weight=2, uniform="t1")
@@ -837,20 +1593,54 @@ class App(ctk.CTk):
     def _t2_on_run(self):
         sub = self.t2_sub_combo.get()
         if not self.dm.substations:
-            messagebox.showwarning("알림", "종합 결과 엑셀 파일을 먼저 로드해주세요.")
+            messagebox.showwarning("알림", "전환선로 매핑 파일을 먼저 로드해주세요.")
+            return
+        if not self.dm.has_data():
+            messagebox.showwarning("알림", "과거 부하량 데이터를 먼저 로드해주세요.")
             return
         if sub == "데이터를 먼저 로드하세요":
             messagebox.showwarning("알림", "변전소를 선택해주세요.")
             return
 
-        all_data = self.dm.get_all_lines_data(sub)
-        self._t2_render(sub, all_data)
+        threshold = self._get_threshold()
 
-    # ── 탭 2 종합 Grid 렌더링 ──
-    def _t2_render(self, sub: str, all_data: list):
+        # 계산 중 표시
+        for w in self.t2_header_fr.winfo_children():
+            w.destroy()
+        for w in self.t2_scroll.winfo_children():
+            w.destroy()
+        ctk.CTkLabel(
+            self.t2_scroll, text="AI 학습 및 예측 중... (선로가 많으면 시간이 걸릴 수 있습니다)",
+            font=ctk.CTkFont(family=FONT_FAMILY, size=13), text_color=self.C["text_sub"],
+        ).pack(pady=40)
+        self.update_idletasks()
+
+        lines = self.dm.substations.get(sub, [])
+        target_year = self.dm._year + 1
+        all_data = []
+
+        for line_idx, (target, transfer) in enumerate(lines):
+            self.status_var.set(
+                f"  [{line_idx+1}/{len(lines)}] {target} → {transfer} 학습/예측 중...")
+            self.update_idletasks()
+
+            pred_result = self._train_and_predict_year(sub, target)
+            if pred_result is None:
+                all_data.append((target, transfer, [None] * 12))
+                continue
+
+            monthly = self._calc_predicted_monthly(
+                target_year, pred_result["target_preds"],
+                pred_result["transfer_preds"], threshold)
+            all_data.append((target, transfer, monthly))
+
+        self.status_var.set(
+            f"  AI 예측 완료 | {target_year}년 | {sub} 변전소 {len(lines)}개 선로")
+        self._t2_render(sub, all_data, target_year)
+
+    def _t2_render(self, sub: str, all_data: list, target_year: int = None):
         C = self.C
 
-        # 기존 위젯 클리어 (고정 헤더 + 스크롤 데이터 모두)
         for w in self.t2_header_fr.winfo_children():
             w.destroy()
         for w in self.t2_scroll.winfo_children():
@@ -865,74 +1655,63 @@ class App(ctk.CTk):
             self.t2_summary_var.set("")
             return
 
-        self.t2_summary_var.set(f"{sub} 변전소  —  총 {len(all_data)}개 선로")
+        year_tag = f"  ({target_year}년 AI 예측)" if target_year else ""
+        self.t2_summary_var.set(f"{sub} 변전소  —  총 {len(all_data)}개 선로{year_tag}")
 
-        # ══════════════════════════════════
-        #  고정 헤더 (스크롤 밖 — 틀고정)
-        # ══════════════════════════════════
+        # ── 고정 헤더 ──
         hdr_fr = tk.Frame(self.t2_header_fr, bg=C["card_bg"])
         hdr_fr.pack(fill="x", padx=(0, 14), pady=(0, 0))
 
-        # ── 상단 스패닝 헤더: "절체 가능 일수" ──
         tk.Label(hdr_fr, text="", font=(FONT_FAMILY, 10),
                  bg=C["grid_hdr"], fg=C["grid_hdr_fg"],
                  height=1, relief="flat",
         ).grid(row=0, column=0, columnspan=2, padx=(0, 1), pady=(0, 0), sticky="nsew")
 
-        tk.Label(hdr_fr, text="절체 가능 일수", font=(FONT_FAMILY, 12, "bold"),
+        hdr_title = f"{target_year}년 AI 예측 — 절체 가능 일수" if target_year else "절체 가능 일수"
+        tk.Label(hdr_fr, text=hdr_title, font=(FONT_FAMILY, 12, "bold"),
                  bg=C["accent"], fg="#ffffff",
                  height=1, relief="flat",
         ).grid(row=0, column=2, columnspan=12, padx=(0, 1), pady=(0, 0), sticky="nsew")
 
-        # 대상선로 헤더
         tk.Label(hdr_fr, text="대상선로", font=(FONT_FAMILY, 11, "bold"),
                  bg=C["grid_hdr"], fg=C["grid_hdr_fg"],
                  width=10, height=2, relief="flat",
         ).grid(row=1, column=0, padx=(0, 1), pady=(0, 1), sticky="nsew")
 
-        # 전환선로 헤더
         tk.Label(hdr_fr, text="전환선로", font=(FONT_FAMILY, 11, "bold"),
                  bg=C["grid_hdr"], fg=C["grid_hdr_fg"],
                  width=10, height=2, relief="flat",
         ).grid(row=1, column=1, padx=(0, 1), pady=(0, 1), sticky="nsew")
 
-        # 월 헤더 (1~12월)
         for m in range(12):
             tk.Label(hdr_fr, text=f"{m+1}월", font=(FONT_FAMILY, 11, "bold"),
                      bg=C["grid_hdr"], fg=C["grid_hdr_fg"],
                      width=6, height=2, relief="flat",
             ).grid(row=1, column=m+2, padx=(0, 1), pady=(0, 1), sticky="nsew")
 
-        # 헤더 열 균등 분배
         hdr_fr.columnconfigure(0, weight=2, uniform="g")
         hdr_fr.columnconfigure(1, weight=2, uniform="g")
         for m in range(12):
             hdr_fr.columnconfigure(m+2, weight=1, uniform="g")
 
-        # ══════════════════════════════════
-        #  데이터 행 (스크롤 영역 안)
-        # ══════════════════════════════════
+        # ── 데이터 행 ──
         grid_fr = tk.Frame(self.t2_scroll, bg=C["card_bg"])
         grid_fr.pack(fill="x", padx=0, pady=(0, 2))
 
         for r_idx, (target, transfer, monthly) in enumerate(all_data):
-            row_num = r_idx
             stripe = C["card_bg"] if r_idx % 2 == 0 else C["grid_line_bg"]
 
-            # ★ 대상선로명 — 클릭 가능한 라벨 (클릭 시 탭 1로 이동)
             target_lbl = tk.Label(
                 grid_fr, text=target, font=(FONT_FAMILY, 11, "bold"),
                 bg=stripe, fg=C["link"],
                 width=10, height=2, anchor="center", relief="flat",
                 cursor="hand2",
             )
-            target_lbl.grid(row=row_num, column=0, padx=(0, 1), pady=(0, 1), sticky="nsew")
-            # 클릭 이벤트 바인딩: 대상선로 클릭 → 탭 1 자동 전환 및 조회
+            target_lbl.grid(row=r_idx, column=0, padx=(0, 1), pady=(0, 1), sticky="nsew")
             target_lbl.bind(
                 "<Button-1>",
                 lambda e, s=sub, t=target: self._t2_navigate_to_t1(s, t),
             )
-            # 호버 효과
             target_lbl.bind(
                 "<Enter>",
                 lambda e, lbl=target_lbl: lbl.configure(fg=C["link_hover"], font=(FONT_FAMILY, 11, "bold underline")),
@@ -942,166 +1721,175 @@ class App(ctk.CTk):
                 lambda e, lbl=target_lbl: lbl.configure(fg=C["link"], font=(FONT_FAMILY, 11, "bold")),
             )
 
-            # 전환선로명
             tk.Label(grid_fr, text=transfer, font=(FONT_FAMILY, 10),
                      bg=stripe, fg=C["highlight"],
                      width=10, height=2, anchor="center", relief="flat",
-            ).grid(row=row_num, column=1, padx=(0, 1), pady=(0, 1), sticky="nsew")
+            ).grid(row=r_idx, column=1, padx=(0, 1), pady=(0, 1), sticky="nsew")
 
-            # 1~12월 데이터 셀
             for m in range(12):
                 days = monthly[m] if m < len(monthly) else None
                 info = get_level_info(days, C)
 
-                cell_bg = info["cell"]
-                cell_fg = info["color"]
                 cell_text = info["text"] if days is not None else "—"
 
                 lbl = tk.Label(
                     grid_fr, text=cell_text,
                     font=(FONT_FAMILY, 11, "bold"),
-                    bg=cell_bg, fg=cell_fg,
+                    bg=info["cell"], fg=info["color"],
                     width=6, height=2, anchor="center", relief="flat",
                 )
-                lbl.grid(row=row_num, column=m+2, padx=(0, 1), pady=(0, 1), sticky="nsew")
+                lbl.grid(row=r_idx, column=m+2, padx=(0, 1), pady=(0, 1), sticky="nsew")
 
-                # 툴팁
                 tip = (f"{target} → {transfer}\n"
                        f"{m+1}월: {cell_text}일\n판정: {info['level']}")
                 self._bind_tooltip(lbl, tip)
 
-        # 데이터 열 균등 분배 (헤더와 동일한 비율)
         grid_fr.columnconfigure(0, weight=2, uniform="g")
         grid_fr.columnconfigure(1, weight=2, uniform="g")
         for m in range(12):
             grid_fr.columnconfigure(m+2, weight=1, uniform="g")
 
     # ══════════════════════════════════
-    #  ★ 탭 2 → 탭 1 자동 전환 (요구사항 1)
+    #  탭 2 → 탭 1 자동 전환
     # ══════════════════════════════════
     def _t2_navigate_to_t1(self, sub: str, target: str):
-        """
-        변전소 종합 조회(탭 2)에서 대상선로 클릭 시:
-        1) 탭 1의 변전소 콤보박스를 해당 변전소로 설정
-        2) 대상선로 콤보박스를 클릭한 선로로 설정
-        3) 전환선로 표시 갱신
-        4) 탭 1("단일 선로 상세 조회")로 자동 전환
-        5) 해당 선로의 결과를 즉시 조회
-        """
-        # ① 변전소 콤보박스 설정
         self.t1_sub_combo.set(sub)
         targets = self.dm.get_target_lines(sub)
         self.t1_target_combo.configure(values=targets or ["(선로 없음)"])
-
-        # ② 대상선로 콤보박스 설정
         self.t1_target_combo.set(target)
 
-        # ③ 전환선로 갱신
         transfer = self.dm.get_transfer_line(sub, target)
         self.t1_transfer_var.set(transfer if transfer else "—")
 
-        # ④ 탭 전환
         self.tabview.set("단일 선로 상세 조회")
-
-        # ⑤ 즉시 결과 조회
         self._t1_on_run()
 
     # ══════════════════════════════════
-    #  ★ 월 카드 클릭 → 일별 상세 팝업 (요구사항 2, 3)
+    #  ★★★ 일별 시간대 부하 상세 팝업 ★★★
     # ══════════════════════════════════
-    def _bind_card_click(self, widget, month_idx: int, sub: str, target: str, transfer: str):
-        """월 카드 위젯에 클릭 이벤트를 바인딩하여 일별 상세 팝업을 연다."""
-        widget.configure(cursor="hand2")
-        widget.bind(
-            "<Button-1>",
-            lambda e, m=month_idx, s=sub, t=target, tr=transfer:
-                self._open_daily_popup(s, t, tr, m),
-        )
-
-    def _open_daily_popup(self, sub: str, target: str, transfer: str, month_idx: int):
+    def _open_daily_popup(self, sub: str, target: str, transfer: str, month: int,
+                          target_year: int = None):
         """
-        ★★★ 일별 상세 사용량 팝업 (요구사항 2, 3) ★★★
+        팝업 상단: 일자 리스트 (Treeview) — 일자, 대상 최대, 전환 최대, 합산 최대, 가능여부
+        팝업 하단: 선택한 일자의 1~24시 시간대별 부하 Treeview (가로 스크롤)
 
-        해당 월의 1일~말일까지 일별 부하를 표로 표시한다.
-        [일자 | 대상선로 부하 | 전환선로 부하 | 합산 부하]
-
-        데이터 매칭 규칙 (★★★매우 중요★★★):
-        - 대상선로 부하: '일일 최대부하' 시트에서 (변전소, 대상선로)로 검색
-        - 전환선로 부하: '전환선로 부하' 시트에서도 (변전소, '대상선로')로 검색
-          → 전환선로명이 아닌 대상선로명으로 행을 찾아야 한다!
-        - 합산 부하 > 10 → 빨간색 행으로 강조 표시
+        target_year가 지정되면 AI 예측 데이터를 사용.
         """
         C = self.C
-        month_label = f"{month_idx + 1}월"
+        threshold = self._get_threshold()
 
-        # ── 팝업 창 생성 ──
+        # 예측 데이터 기반 daily_data 생성
+        if target_year:
+            cache_key = (sub, target)
+            cache = self._pred_cache.get(cache_key)
+            if not cache:
+                messagebox.showwarning("알림", "예측 데이터가 없습니다. 먼저 결과 조회를 실행하세요.")
+                return
+
+            target_preds = cache["target_preds"]
+            transfer_preds = cache["transfer_preds"]
+            n_days = calendar.monthrange(target_year, month)[1]
+            daily_data = []
+            for day in range(1, n_days + 1):
+                date_str = f"{target_year}{month:02d}{day:02d}"
+                t_pred = target_preds.get(date_str)
+                tr_pred = transfer_preds.get(date_str)
+                if t_pred and tr_pred:
+                    sum_hours = [round(t + tr, 2) for t, tr in
+                                 zip(t_pred["pred_hours"], tr_pred["pred_hours"])]
+                    sum_max = round(max(sum_hours), 2)
+                    daily_data.append({
+                        "day": day,
+                        "date_str": date_str,
+                        "weekday": t_pred["weekday"],
+                        "is_weekend": t_pred["is_weekend"],
+                        "target_hours": t_pred["pred_hours"],
+                        "transfer_hours": tr_pred["pred_hours"],
+                        "sum_hours": sum_hours,
+                        "target_max": t_pred["pred_max"],
+                        "transfer_max": tr_pred["pred_max"],
+                        "sum_max": sum_max,
+                        "possible": sum_max <= threshold,
+                    })
+            month_label = f"{target_year}년 {month}월 (AI 예측)"
+        else:
+            month_label = f"{month}월"
+            daily_data = self.dm.get_daily_detail(sub, target, month)
+
         popup = ctk.CTkToplevel(self)
-        popup.title(f"일별 상세 사용량 — {sub} | {target} → {transfer} | {month_label}")
-        popup.geometry("720x680")
+        popup.title(f"일별 부하 상세 — {sub} | {target} → {transfer} | {month_label}")
+        popup.geometry("1200x920")
         popup.resizable(True, True)
-        popup.transient(self)
-        popup.grab_set()
+        popup.minsize(900, 700)
 
-        # 중앙 배치
+        # ★ 최상단 노출: 열릴 때 맨 앞으로, 이후 사용자 자유 조작 허용
+        popup.attributes("-topmost", True)
+        popup.after(300, lambda: popup.attributes("-topmost", False))
+        popup.focus_force()
+        popup.lift()
+
         popup.update_idletasks()
-        px = self.winfo_x() + (self.winfo_width() - 720) // 2
-        py = self.winfo_y() + (self.winfo_height() - 680) // 2
-        popup.geometry(f"+{px}+{py}")
+        px = self.winfo_x() + (self.winfo_width() - 1200) // 2
+        py = self.winfo_y() + (self.winfo_height() - 920) // 2
+        popup.geometry(f"+{max(px, 0)}+{max(py, 0)}")
 
-        # ── 헤더 영역 ──
+        # ── 헤더 ──
         header_fr = ctk.CTkFrame(popup, fg_color=C["title_bg"], corner_radius=0, height=50)
         header_fr.pack(fill="x")
         header_fr.pack_propagate(False)
 
         ctk.CTkLabel(
             header_fr,
-            text=f"  {month_label} 일별 상세 사용량",
+            text=f"  {month_label} 일별 시간대 부하 상세",
             font=ctk.CTkFont(family=FONT_FAMILY, size=16, weight="bold"),
             text_color=C["title_fg"],
         ).pack(side="left", padx=14)
 
         ctk.CTkLabel(
             header_fr,
-            text=f"{sub}  |  {target} → {transfer}",
+            text=f"{sub}  |  대상: {target}  |  전환: {transfer}",
             font=ctk.CTkFont(family=FONT_FAMILY, size=11),
             text_color=C["subtitle_fg"],
         ).pack(side="left", padx=14)
 
         # ── 범례 ──
         legend_fr = tk.Frame(popup, bg=C["card_bg"])
-        legend_fr.pack(fill="x", padx=14, pady=(8, 2))
+        legend_fr.pack(fill="x", padx=14, pady=(6, 2))
 
-        tk.Label(
-            legend_fr,
-            text=f"※ 합산 부하 > {OVERLOAD_THRESHOLD} 시 빨간색으로 표시됩니다",
-            font=(FONT_FAMILY, 10), bg=C["card_bg"], fg=C["ng"],
+        pred_tag = "  [AI 예측]" if target_year else ""
+        tk.Label(legend_fr,
+                 text=f"※ 합산 최대 부하 > {threshold} → 불가(X) / ≤ {threshold} → 가능(O){pred_tag}",
+                 font=(FONT_FAMILY, 10), bg=C["card_bg"], fg=C["ng"],
         ).pack(side="left")
 
-        # ── 일별 부하 데이터 가져오기 ──
-        if not self.dm.has_daily_data():
-            # 일별 데이터가 로드되지 않은 경우
+        # 주말 범례
+        wknd_box = tk.Frame(legend_fr, bg=C["weekend_bg"], width=14, height=14)
+        wknd_box.pack(side="left", padx=(20, 3))
+        wknd_box.pack_propagate(False)
+        tk.Label(legend_fr, text="주말(토/일)", font=(FONT_FAMILY, 10),
+                 bg=C["card_bg"], fg=C["weekend_fg"]).pack(side="left")
+
+        if not daily_data:
             ctk.CTkLabel(
-                popup,
-                text="일별 부하 데이터가 로드되지 않았습니다.\n"
-                     "엑셀 파일에 '일일 최대부하' 및 '전환선로 부하' 시트가 필요합니다.",
-                font=ctk.CTkFont(family=FONT_FAMILY, size=13),
-                text_color=C["text_sub"],
+                popup, text="해당 월의 부하 데이터가 없습니다.",
+                font=ctk.CTkFont(family=FONT_FAMILY, size=13), text_color=C["text_sub"],
             ).pack(expand=True)
             return
 
-        # ★★★ 핵심: 대상선로 부하와 전환선로 부하 모두 '대상선로명'으로 검색 ★★★
-        target_days, transfer_days = self.dm.get_daily_data(sub, target, month_idx)
-        actual_days = self.dm.get_month_actual_days(month_idx)
+        # ══════════════════════════════════
+        #  상단: 일자별 판정 리스트 (Treeview)
+        # ══════════════════════════════════
+        top_label = tk.Label(popup, text="  ▼ 일자별 판정 리스트 (클릭하면 하단에 시간대별 부하 표시)",
+                             font=(FONT_FAMILY, 11, "bold"), bg=C["card_bg"], fg=C["text"],
+                             anchor="w")
+        top_label.pack(fill="x", padx=14, pady=(6, 2))
 
-        # ── Treeview 테이블 ──
-        table_fr = tk.Frame(popup, bg=C["card_bg"])
-        table_fr.pack(fill="both", expand=True, padx=14, pady=(4, 8))
+        tree_fr = tk.Frame(popup, bg=C["card_bg"])
+        tree_fr.pack(fill="x", padx=14, pady=(0, 4))
 
         style = ttk.Style()
         style.theme_use("clam")
-
-        # 고유 스타일 이름으로 충돌 방지
-        sname = "Popup.Treeview"
+        sname = "DailyPopup.Treeview"
         style.configure(sname, font=(FONT_FAMILY, 11), rowheight=26,
                         background=C["card_bg"], fieldbackground=C["card_bg"],
                         foreground=C["text"], borderwidth=0)
@@ -1110,109 +1898,303 @@ class App(ctk.CTk):
                         borderwidth=0, relief="flat")
         style.map(sname, background=[("selected", C["tree_sel"])])
 
-        cols = ("day", "target_load", "transfer_load", "total_load")
-        tree = ttk.Treeview(table_fr, columns=cols, show="headings",
-                            style=sname, height=min(actual_days, 20))
-        tree.heading("day",           text="일자")
-        tree.heading("target_load",   text=f"대상선로 부하 ({target})")
-        tree.heading("transfer_load", text=f"전환선로 부하 ({transfer})")
-        tree.heading("total_load",    text="합산 부하")
-        tree.column("day",           width=70,  anchor="center")
-        tree.column("target_load",   width=180, anchor="center")
-        tree.column("transfer_load", width=180, anchor="center")
-        tree.column("total_load",    width=150, anchor="center")
+        cols = ("day", "weekday", "target_max", "transfer_max", "sum_max", "judge")
+        tree = ttk.Treeview(tree_fr, columns=cols, show="headings",
+                            style=sname, height=min(len(daily_data), 12))
+        tree.heading("day", text="일자")
+        tree.heading("weekday", text="요일")
+        tree.heading("target_max", text=f"대상 일최대 ({target})")
+        tree.heading("transfer_max", text=f"전환 일최대 ({transfer})")
+        tree.heading("sum_max", text="합산 일최대")
+        tree.heading("judge", text="가능여부")
+        tree.column("day", width=65, anchor="center")
+        tree.column("weekday", width=50, anchor="center")
+        tree.column("target_max", width=185, anchor="center")
+        tree.column("transfer_max", width=185, anchor="center")
+        tree.column("sum_max", width=140, anchor="center")
+        tree.column("judge", width=80, anchor="center")
 
-        # 행 스타일: 정상 / 초과(빨간색)
-        tree.tag_configure("normal",   background=C["card_bg"])
+        tree.tag_configure("normal", background=C["card_bg"])
         tree.tag_configure("overload", background=C["overload_bg"], foreground=C["overload_fg"])
-        tree.tag_configure("stripe",   background=C["grid_line_bg"])
+        tree.tag_configure("stripe", background=C["grid_line_bg"])
+        tree.tag_configure("weekend", background=C["weekend_bg"], foreground=C["weekend_fg"])
+        tree.tag_configure("weekend_overload", background=C["overload_bg"], foreground=C["overload_fg"])
 
-        # ── 일별 데이터 삽입 ──
-        overload_count = 0
-        for d in range(actual_days):
-            t_val = target_days[d]
-            tr_val = transfer_days[d]
-
-            # 값 표시: 데이터 있으면 소수점 1자리, 없으면 "—" (0 또는 빈칸 처리)
-            t_str = f"{t_val:.1f}" if t_val is not None else "0"
-            tr_str = f"{tr_val:.1f}" if tr_val is not None else "0"
-
-            # 합산 부하 계산 (None은 0으로 처리)
-            t_num = t_val if t_val is not None else 0.0
-            tr_num = tr_val if tr_val is not None else 0.0
-            total = t_num + tr_num
-            total_str = f"{total:.1f}"
-
-            # ★ 합산 부하 > 10 이면 빨간색 행 강조
-            if total > OVERLOAD_THRESHOLD:
-                tag = "overload"
-                overload_count += 1
+        possible_count = 0
+        for idx, dd in enumerate(daily_data):
+            is_wknd = dd.get("is_weekend", False)
+            if not dd["possible"]:
+                tag = "weekend_overload" if is_wknd else "overload"
+            elif is_wknd:
+                tag = "weekend"
             else:
-                tag = "stripe" if d % 2 == 1 else "normal"
+                tag = "stripe" if idx % 2 == 1 else "normal"
+
+            judge_str = "O (가능)" if dd["possible"] else "X (불가)"
+            if dd["possible"]:
+                possible_count += 1
+
+            weekday_str = dd.get("weekday", "")
+            # 토/일 표시 강조
+            if weekday_str in ("토", "일"):
+                weekday_str = f"({weekday_str})"
 
             tree.insert("", "end",
-                        values=(f"{d + 1}일", t_str, tr_str, total_str),
+                        values=(f"{dd['day']}일",
+                                weekday_str,
+                                f"{dd['target_max']:.1f}",
+                                f"{dd['transfer_max']:.1f}",
+                                f"{dd['sum_max']:.1f}",
+                                judge_str),
                         tags=(tag,))
 
-        sb = ttk.Scrollbar(table_fr, orient="vertical", command=tree.yview)
+        sb = ttk.Scrollbar(tree_fr, orient="vertical", command=tree.yview)
         tree.configure(yscrollcommand=sb.set)
         tree.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
 
-        # ── 하단 요약 ──
-        summary_fr = tk.Frame(popup, bg=C["card_bg"])
-        summary_fr.pack(fill="x", padx=14, pady=(0, 10))
+        # 요약 (주말 일수 표시 추가)
+        weekend_count = sum(1 for dd in daily_data if dd.get("is_weekend"))
+        sum_label = tk.Label(popup,
+                             text=(f"  총 {len(daily_data)}일  |  가능(O): {possible_count}일  |  "
+                                   f"불가(X): {len(daily_data) - possible_count}일  |  "
+                                   f"주말: {weekend_count}일"),
+                             font=(FONT_FAMILY, 11, "bold"), bg=C["card_bg"],
+                             fg=C["ok"] if possible_count > len(daily_data) // 2 else C["ng"],
+                             anchor="w")
+        sum_label.pack(fill="x", padx=14, pady=(0, 4))
 
-        summary_text = f"총 {actual_days}일"
-        if overload_count > 0:
-            summary_text += f"  |  합산 부하 초과({OVERLOAD_THRESHOLD} 초과): {overload_count}일"
-        tk.Label(
-            summary_fr, text=summary_text,
-            font=(FONT_FAMILY, 11, "bold"), bg=C["card_bg"],
-            fg=C["ng"] if overload_count > 0 else C["text_sub"],
-        ).pack(side="left")
+        # ══════════════════════════════════════════
+        #  하단: 시간대별 부하 프로필 (Treeview + 가로/세로 스크롤)
+        # ══════════════════════════════════════════
+        profile_title_var = tk.StringVar(
+            value="  ▼ 시간대별 부하 프로필 (상단 리스트에서 일자를 클릭하세요)")
+        profile_title_lbl = tk.Label(popup, textvariable=profile_title_var,
+                                     font=(FONT_FAMILY, 11, "bold"),
+                                     bg=C["card_bg"], fg=C["text"], anchor="w")
+        profile_title_lbl.pack(fill="x", padx=14, pady=(4, 2))
 
-        # 닫기 버튼
+        # 프로필 Treeview 영역
+        profile_outer = tk.Frame(popup, bg=C["card_bg"])
+        profile_outer.pack(fill="both", expand=True, padx=14, pady=(0, 4))
+
+        # 스타일
+        pname = "HourlyProfile.Treeview"
+        style.configure(pname, font=(FONT_FAMILY, 11), rowheight=30,
+                        background=C["card_bg"], fieldbackground=C["card_bg"],
+                        foreground=C["text"], borderwidth=0)
+        style.configure(f"{pname}.Heading", font=(FONT_FAMILY, 10, "bold"),
+                        background=C["tree_hdr_bg"], foreground=C["tree_hdr_fg"],
+                        borderwidth=0, relief="flat")
+        style.map(pname, background=[("selected", C["tree_sel"])])
+
+        # 컬럼 정의: 구분 + 1시~24시 + MAX = 26개
+        pcols = ("label",) + tuple(f"h{h}" for h in range(1, 25)) + ("max_val",)
+        profile_tree = ttk.Treeview(profile_outer, columns=pcols, show="headings",
+                                     style=pname, height=4)
+
+        profile_tree.heading("label", text="구분")
+        profile_tree.column("label", width=130, minwidth=110, stretch=True, anchor="center")
+        for h in range(1, 25):
+            profile_tree.heading(f"h{h}", text=f"{h}시")
+            profile_tree.column(f"h{h}", width=65, minwidth=55, stretch=True, anchor="center")
+        profile_tree.heading("max_val", text="MAX")
+        profile_tree.column("max_val", width=75, minwidth=60, stretch=True, anchor="center")
+
+        # 행 태그 (전체 행 색상)
+        profile_tree.tag_configure("target",
+                                    foreground=C["graph_target"])
+        profile_tree.tag_configure("transfer",
+                                    background=C["grid_line_bg"], foreground=C["graph_transfer"])
+        profile_tree.tag_configure("sum_ok",
+                                    foreground=C["ok"], background=C["ok_light"])
+        profile_tree.tag_configure("sum_ng",
+                                    background=C["overload_bg"], foreground=C["overload_fg"])
+
+        # 가로 + 세로 스크롤바
+        profile_xsb = ttk.Scrollbar(profile_outer, orient="horizontal",
+                                     command=profile_tree.xview)
+        profile_ysb = ttk.Scrollbar(profile_outer, orient="vertical",
+                                     command=profile_tree.yview)
+        profile_tree.configure(xscrollcommand=profile_xsb.set,
+                                yscrollcommand=profile_ysb.set)
+
+        profile_tree.grid(row=0, column=0, sticky="nsew")
+        profile_ysb.grid(row=0, column=1, sticky="ns")
+        profile_xsb.grid(row=1, column=0, sticky="ew")
+        profile_outer.grid_rowconfigure(0, weight=1)
+        profile_outer.grid_columnconfigure(0, weight=1)
+
+        # 임계값 안내
+        pred_marker = "  [AI 예측 데이터]" if target_year else ""
+        threshold_lbl = tk.Label(popup,
+                                  text=f"  임계값: {threshold}{pred_marker}  |  ※ 창을 최대화하거나 넓히면 더 많은 시간대를 한눈에 볼 수 있습니다",
+                                  font=(FONT_FAMILY, 9), bg=C["card_bg"], fg=C["ng"],
+                                  anchor="w")
+        threshold_lbl.pack(fill="x", padx=14, pady=(0, 2))
+
+        # ══════════════════════════════════════════
+        #  하단: 시간대별 부하 그래프 (matplotlib)
+        # ══════════════════════════════════════════
+        chart_title_var = tk.StringVar(
+            value="  ▼ 시간대별 부하 그래프 (상단 리스트에서 일자를 클릭하세요)")
+        chart_title_lbl = tk.Label(popup, textvariable=chart_title_var,
+                                    font=(FONT_FAMILY, 11, "bold"),
+                                    bg=C["card_bg"], fg=C["text"], anchor="w")
+        chart_title_lbl.pack(fill="x", padx=14, pady=(4, 2))
+
+        chart_fr = tk.Frame(popup, bg=C["card_bg"])
+        chart_fr.pack(fill="both", expand=True, padx=14, pady=(0, 4))
+
+        # matplotlib Figure 생성
+        fig_bg = C["card_bg"]
+        fig = Figure(figsize=(10, 3), dpi=96, facecolor=fig_bg)
+        ax = fig.add_subplot(111)
+        ax.set_facecolor(fig_bg)
+        ax.set_xlim(0.5, 24.5)
+        ax.set_xticks(range(1, 25))
+        ax.set_xticklabels([f"{h}시" for h in range(1, 25)], fontsize=8)
+        ax.set_xlabel("시간대", fontsize=10)
+        ax.set_ylabel("부하", fontsize=10)
+        ax.tick_params(colors=C["text"], labelsize=8)
+        ax.xaxis.label.set_color(C["text"])
+        ax.yaxis.label.set_color(C["text"])
+        for spine in ax.spines.values():
+            spine.set_color(C["grid_line_bg"])
+        ax.text(0.5, 0.5, "일자를 선택하세요", transform=ax.transAxes,
+                ha="center", va="center", fontsize=14, color=C["text_sub"], alpha=0.5)
+        fig.tight_layout(pad=2)
+
+        canvas_widget = FigureCanvasTkAgg(fig, master=chart_fr)
+        canvas_widget.draw()
+        canvas_widget.get_tk_widget().pack(fill="both", expand=True)
+
+        # ── 일자 클릭 → 프로필 갱신 + 그래프 갱신 ──
+        is_pred_mode = target_year is not None
+        label_suffix = " (예측)" if is_pred_mode else ""
+
+        def on_tree_select(event):
+            sel = tree.selection()
+            if not sel:
+                return
+            idx = tree.index(sel[0])
+            if idx >= len(daily_data):
+                return
+            dd = daily_data[idx]
+
+            # 타이틀 갱신
+            judge = "가능(O)" if dd["possible"] else "불가(X)"
+            wkday = dd.get("weekday", "")
+            wknd_tag = "  [주말]" if dd.get("is_weekend") else ""
+            profile_title_var.set(
+                f"  ▼ {dd['day']}일({wkday}) 시간대별 부하{label_suffix}  |  합산 최대: {dd['sum_max']:.1f}  |  판정: {judge}{wknd_tag}")
+            profile_title_lbl.configure(
+                bg="#8e44ad" if is_pred_mode else C["accent"], fg="#ffffff")
+
+            # 기존 행 삭제
+            for item in profile_tree.get_children():
+                profile_tree.delete(item)
+
+            # 행 1: 대상선로
+            vals = [f"대상({target}){label_suffix}"] + \
+                   [f"{v:.1f}" for v in dd["target_hours"]] + \
+                   [f"{dd['target_max']:.1f}"]
+            profile_tree.insert("", "end", values=vals, tags=("target",))
+
+            # 행 2: 전환선로
+            vals = [f"전환({transfer}){label_suffix}"] + \
+                   [f"{v:.1f}" for v in dd["transfer_hours"]] + \
+                   [f"{dd['transfer_max']:.1f}"]
+            profile_tree.insert("", "end", values=vals, tags=("transfer",))
+
+            # 행 3: 합산 부하 — 초과 시간대는 ▲ 표시
+            sum_tag = "sum_ok" if dd["possible"] else "sum_ng"
+            sum_vals = []
+            for v in dd["sum_hours"]:
+                if v > threshold:
+                    sum_vals.append(f"▲{v:.1f}")
+                else:
+                    sum_vals.append(f"{v:.1f}")
+            vals = [f"합산 부하{label_suffix}"] + sum_vals + [f"{dd['sum_max']:.1f}"]
+            profile_tree.insert("", "end", values=vals, tags=(sum_tag,))
+
+            # ── 그래프 갱신 ──
+            chart_title_var.set(
+                f"  ▼ {dd['day']}일({wkday}) 시간대별 부하 그래프{label_suffix}  |  판정: {judge}{wknd_tag}")
+            chart_title_lbl.configure(
+                bg="#8e44ad" if is_pred_mode else C["accent"], fg="#ffffff")
+
+            ax.clear()
+            hours = list(range(1, 25))
+
+            # 대상선로
+            ax.plot(hours, dd["target_hours"], color=C["graph_target"],
+                    linestyle="--", linewidth=1.5, marker="o", markersize=4,
+                    label=f"대상({target}){label_suffix}")
+
+            # 전환선로
+            ax.plot(hours, dd["transfer_hours"], color=C["graph_transfer"],
+                    linestyle="--", linewidth=1.5, marker="s", markersize=4,
+                    label=f"전환({transfer}){label_suffix}")
+
+            # 합산 부하 (실선, 굵게)
+            ax.plot(hours, dd["sum_hours"], color=C["graph_total"],
+                    linestyle="-", linewidth=2.5, marker="D", markersize=4,
+                    label=f"합산 부하{label_suffix}", zorder=5)
+
+            # 초과 구간 강조
+            over_hours = [h for h, v in zip(hours, dd["sum_hours"]) if v > threshold]
+            over_vals = [v for v in dd["sum_hours"] if v > threshold]
+            if over_hours:
+                ax.scatter(over_hours, over_vals, color=C["graph_total"],
+                           s=80, zorder=6, edgecolors="white", linewidths=1.2)
+
+            # 임계값 기준선
+            ax.axhline(y=threshold, color=C["ng"], linestyle=":",
+                       linewidth=1.5, alpha=0.8, label=f"임계값({threshold})")
+
+            # 초과 영역 배경
+            ax.fill_between(hours, threshold, dd["sum_hours"],
+                            where=[v > threshold for v in dd["sum_hours"]],
+                            color=C["graph_total"], alpha=0.1, interpolate=True)
+
+            # 축 설정
+            ax.set_xlim(0.5, 24.5)
+            ax.set_xticks(range(1, 25))
+            ax.set_xticklabels([f"{h}시" for h in range(1, 25)], fontsize=8)
+            ax.set_xlabel("시간대", fontsize=10)
+            ax.set_ylabel("부하" + (" (예측)" if is_pred_mode else ""), fontsize=10)
+            ax.set_facecolor(fig_bg)
+            ax.tick_params(colors=C["text"], labelsize=8)
+            ax.xaxis.label.set_color(C["text"])
+            ax.yaxis.label.set_color(C["text"])
+            for spine in ax.spines.values():
+                spine.set_color(C["grid_line_bg"])
+
+            # 범례
+            ax.legend(loc="upper right", fontsize=9, framealpha=0.8,
+                      facecolor=fig_bg, edgecolor=C["grid_line_bg"],
+                      labelcolor=C["text"])
+
+            ax.grid(True, alpha=0.3, color=C["grid_line_bg"])
+            fig.tight_layout(pad=2)
+            canvas_widget.draw()
+
+        tree.bind("<<TreeviewSelect>>", on_tree_select)
+
+        # 버튼 영역
+        btn_fr = tk.Frame(popup, bg=C["card_bg"])
+        btn_fr.pack(fill="x", padx=14, pady=(0, 8))
+
         ctk.CTkButton(
-            summary_fr, text="닫기", width=80, height=30,
+            btn_fr, text="닫기", width=80, height=30,
             font=ctk.CTkFont(family=FONT_FAMILY, size=12),
             command=popup.destroy,
         ).pack(side="right")
 
     # ══════════════════════════════════
-    #  공통 이벤트
-    # ══════════════════════════════════
-    def _on_select_excel(self):
-        path = filedialog.askopenfilename(
-            title="종합 결과 엑셀 파일 선택",
-            filetypes=[("Excel", "*.xlsx *.xls"), ("All", "*.*")],
-        )
-        if not path:
-            return
-        self.excel_var.set(path)
-        ok, msg = self.dm.load_excel(path)
-
-        if ok:
-            self.status_var.set("  " + msg)
-            subs = self.dm.get_substation_list()
-
-            # 탭 1 콤보 갱신
-            self.t1_sub_combo.configure(values=subs)
-            if subs:
-                self.t1_sub_combo.set(subs[0])
-                self._t1_on_sub(subs[0])
-
-            # 탭 2 콤보 갱신
-            self.t2_sub_combo.configure(values=subs)
-            if subs:
-                self.t2_sub_combo.set(subs[0])
-        else:
-            self.status_var.set("  " + msg)
-            messagebox.showerror("오류", msg)
-
-    # ──────────────────────────────────
     #  다크/라이트 토글
-    # ──────────────────────────────────
+    # ══════════════════════════════════
     def _toggle_theme(self):
         self.is_dark = not self.is_dark
         self.C = DARK if self.is_dark else LIGHT
@@ -1225,9 +2207,9 @@ class App(ctk.CTk):
             text="☀️ 라이트모드" if self.is_dark else "🌙 다크모드"
         )
 
-    # ──────────────────────────────────
+    # ══════════════════════════════════
     #  툴팁
-    # ──────────────────────────────────
+    # ══════════════════════════════════
     def _bind_tooltip(self, widget, text: str):
         tip_win = None
 
